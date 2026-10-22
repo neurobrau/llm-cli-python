@@ -423,3 +423,111 @@ def test_cleanup_then_switch_back_starts_empty(store: HistoryStore) -> None:
     assert session.messages == ()  # deleted conversations do not come back from memory
     remaining = [store.load(path) for path in store.list_paths()]
     assert [(c.provider, c.messages) for c in remaining] == [("openai", ())]  # the new empty one
+
+
+# ----- Task 008a: streamed exchanges -----
+
+from neurobrau_cli.providers.base import (  # noqa: E402
+    ProviderError,
+    ReasoningDelta,
+    StreamCompleted,
+    StreamFailed,
+    StreamIncomplete,
+    TextDelta,
+)
+from neurobrau_cli.session import stream_exchange  # noqa: E402
+
+
+class ScriptedStream:
+    """A stream function yielding scripted events and recording closing."""
+
+    def __init__(self, *scripts: list[object]) -> None:
+        self.scripts = list(scripts)
+        self.seen: list[list[str]] = []
+        self.closed = 0
+
+    def __call__(self, messages: Sequence[Message]):
+        self.seen.append([m.content for m in messages])
+        return self._events(self.scripts.pop(0))
+
+    def _events(self, script: list[object]):
+        try:
+            for event in script:
+                if isinstance(event, BaseException):
+                    raise event
+                yield event
+        finally:
+            self.closed += 1
+
+
+def done(text: str) -> StreamCompleted:
+    return StreamCompleted(GenerationResult(text))
+
+
+def test_streamed_text_is_assembled_and_committed(store: HistoryStore) -> None:
+    deltas: list[object] = []
+    session = ChatSession.restore(store, provider="ollama", model="m")
+    stream = ScriptedStream([TextDelta("Hel"), ReasoningDelta("thinking"), TextDelta("lo"), done("Hello")])
+
+    terminal, warning = session.send_stream("Hi", stream, deltas.append)
+
+    assert isinstance(terminal, StreamCompleted) and warning is None
+    assert deltas == [TextDelta("Hel"), ReasoningDelta("thinking"), TextDelta("lo")]
+    assert session.messages == (Message("user", "Hi"), Message("assistant", "Hello"))
+    assert saved_messages(store, session) == [
+        {"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}
+    ]
+    assert stream.closed == 1
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    [StreamIncomplete("the max output token limit was reached", "Par"),
+     StreamFailed(ProviderError("boom"), "Par")],
+)
+def test_incomplete_or_failed_streams_are_not_saved(store: HistoryStore, terminal: object) -> None:
+    session = ChatSession.restore(store, provider="ollama", model="m")
+    session.send("Before", echo)
+    before = store.path_for(session.id).read_bytes()
+
+    result, warning = session.send_stream("Hi", ScriptedStream([TextDelta("Par"), terminal]),
+                                          lambda delta: None)
+
+    assert result == terminal and warning is None
+    assert [m.content for m in session.messages] == ["Before", "echo: Before"]
+    assert store.path_for(session.id).read_bytes() == before
+
+
+def test_interrupt_keeps_history_and_closes_stream(store: HistoryStore) -> None:
+    session = ChatSession.restore(store, provider="ollama", model="m")
+    session.send("Before", echo)
+    stream = ScriptedStream([TextDelta("Par"), TextDelta("tial"), done("Partial")])
+
+    def interrupt(delta: object) -> None:
+        if delta == TextDelta("tial"):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        session.send_stream("Hi", stream, interrupt)
+
+    assert len(session.messages) == 2
+    assert stream.closed == 1
+
+
+def test_stream_ending_without_terminal_event_is_a_failure() -> None:
+    conversation = ChatSession().conversation
+
+    terminal = stream_exchange(conversation, "Hi", ScriptedStream([TextDelta("x")]), lambda d: None)
+
+    assert isinstance(terminal, StreamFailed)
+    assert conversation.messages == ()
+
+
+def test_streamed_turns_send_full_history() -> None:
+    session = ChatSession(provider="ollama", model="m")
+    stream = ScriptedStream([TextDelta("A1"), done("A1")], [TextDelta("A2"), done("A2")])
+
+    session.send_stream("Q1", stream, lambda d: None)
+    session.send_stream("Q2", stream, lambda d: None)
+
+    assert stream.seen == [["Q1"], ["Q1", "A1", "Q2"]]

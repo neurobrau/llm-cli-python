@@ -518,6 +518,7 @@ def fake_ollama(monkeypatch: pytest.MonkeyPatch) -> FakeOllama:
     """Replace Ollama's HTTP transport; no network access."""
     fake = FakeOllama()
     monkeypatch.setattr(cli.ollama_provider, "urllib_transport", fake)
+    monkeypatch.setattr(cli.ollama_provider, "urllib_stream_transport", fake.streaming)
     return fake
 
 
@@ -857,3 +858,153 @@ def test_unknown_provider_in_active_file_falls_back(
 
     assert main([]) == 0
     assert "Provider: openai" in capsys.readouterr().out
+
+
+# ----- Task 008a: --stream -----
+
+from types import SimpleNamespace  # noqa: E402
+
+from fakes import ndjson, ollama_chunks  # noqa: E402
+
+
+def test_help_lists_stream(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--help"])
+
+    assert "--stream" in capsys.readouterr().out
+
+
+def test_stream_one_shot_ollama(fake_ollama: FakeOllama, capsys: pytest.CaptureFixture[str]) -> None:
+    fake_ollama.streaming.bodies = [ollama_chunks("Neural ", "networks ", "learn.")]
+
+    exit_code = main(["--provider", "ollama", "--stream", "--usage", "Explain neural networks."])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == "Neural networks learn.\n"
+    assert captured.err == (
+        "Token usage: input=7, output=3, total=10\n"
+        "Duration: 2.50 s (load 0.50 s, generation 1.00 s)\n"
+    )
+    assert fake_ollama.chat_payloads[0]["stream"] is True
+    assert fake_ollama.streaming.closed == 1
+
+
+def test_stream_prints_each_delta_immediately(
+    fake_ollama: FakeOllama, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+
+    class Out:
+        def write(self, text: str) -> None:
+            events.append(f"write:{text}")
+
+        def flush(self) -> None:
+            events.append("flush")
+
+    fake_ollama.streaming.bodies = [[ndjson({"message": {"content": "A"}}),
+                                     ndjson({"message": {"content": "B"}}), ollama_chunks()]]
+
+    cli.stream_prompt(
+        cli.create_providers()["ollama"], SimpleNamespace(prompt="Hi", usage=False),
+        cli.GenerationOptions("qwen3.5:4b"), Out(), Out(),
+    )
+
+    assert events[:4] == ["write:A", "flush", "write:B", "flush"]
+
+
+def test_stream_incomplete_exit_code(fake_ollama: FakeOllama, capsys: pytest.CaptureFixture[str]) -> None:
+    fake_ollama.streaming.bodies = [ollama_chunks("Once upon", done={"done_reason": "length"})]
+
+    exit_code = main(["--provider", "ollama", "--stream", "--max-output-tokens", "5", "Story"])
+
+    captured = capsys.readouterr()
+    assert exit_code == cli.EXIT_INCOMPLETE == 8
+    assert captured.out == "Once upon\n"
+    assert "warning: response incomplete: the max output token limit was reached." in captured.err
+
+
+def test_stream_failure_exit_codes(fake_ollama: FakeOllama, capsys: pytest.CaptureFixture[str]) -> None:
+    fake_ollama.streaming.bodies = [
+        [ndjson({"message": {"content": "Par"}}),
+         OllamaProviderError("Connection to Ollama failed.", ErrorKind.CONNECTION)],
+    ]
+
+    assert main(["--provider", "ollama", "--stream", "Hi"]) == 7
+    captured = capsys.readouterr()
+    assert captured.out == "Par\n"
+    assert "error: Connection to Ollama failed." in captured.err
+
+
+def test_stream_interrupt(fake_ollama: FakeOllama, capsys: pytest.CaptureFixture[str]) -> None:
+    fake_ollama.streaming.bodies = [[ndjson({"message": {"content": "Par"}}), KeyboardInterrupt()]]
+
+    assert main(["--provider", "ollama", "--stream", "Hi"]) == 130
+    captured = capsys.readouterr()
+    assert captured.out == "Par\n"
+    assert "interrupted" in captured.err
+    assert fake_ollama.streaming.closed == 1
+
+
+def test_stream_one_shot_openai(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    sdk_stream = MagicMock()
+    sdk_stream.__iter__.return_value = iter([
+        SimpleNamespace(type="response.output_text.delta", delta="Hi "),
+        SimpleNamespace(type="response.output_text.delta", delta="there"),
+        SimpleNamespace(type="response.completed", response=SimpleNamespace(
+            id="r", model="gpt-6-luna", output_text="Hi there",
+            usage=SimpleNamespace(input_tokens=2, output_tokens=2, total_tokens=4))),
+    ])
+    client = MagicMock()
+    client.responses.create.return_value = sdk_stream
+    monkeypatch.setattr(cli.openai_provider, "create_client", lambda: client)
+
+    assert main(["--stream", "--answer-style", "brief", "Hello"]) == 0
+
+    assert capsys.readouterr().out == "Hi there\n"
+    kwargs = client.responses.create.call_args.kwargs
+    assert (kwargs["stream"], kwargs["store"], kwargs["reasoning"]) == (True, False, {"effort": "none"})
+    assert "concise" in kwargs["instructions"]
+    sdk_stream.close.assert_called_once()
+
+
+def test_stream_openai_without_key(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--stream", "Hello"]) == 3
+    assert "OPENAI_API_KEY is not set" in capsys.readouterr().err
+
+
+def test_default_one_shot_does_not_stream(fake_ollama: FakeOllama) -> None:
+    main(["--provider", "ollama", "Hi"])
+
+    assert fake_ollama.chat_payloads[0]["stream"] is False
+    assert fake_ollama.streaming.opened == 0
+
+
+def test_plain_chat_streams_and_saves_only_completed_answers(
+    fake_ollama: FakeOllama,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_state_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_ollama.streaming.bodies = [
+        ollama_chunks("First ", "answer"),
+        ollama_chunks("Cut", done={"done_reason": "length"}),
+        ollama_chunks("Third"),
+    ]
+    feed_input(monkeypatch, "One", "Two", "Three")
+
+    assert main(["--provider", "ollama", "--plain", "--stream"]) == 0
+
+    out = capsys.readouterr().out
+    assert "AI > First answer\n" in out and "AI > Cut\n" in out
+    saved = json.loads(history_files(isolated_state_home)[0].read_text())
+    assert [m["content"] for m in saved["messages"]] == ["One", "First answer", "Three", "Third"]
+    assert [m["content"] for m in fake_ollama.chat_payloads[2]["messages"]] == [
+        "One", "First answer", "Three"
+    ]
+
+
+def test_tui_is_not_streaming_yet(fake_chat_backend: MagicMock, fake_tui: MagicMock) -> None:
+    main(["--stream"])
+
+    fake_tui.run_tui.assert_called_once()

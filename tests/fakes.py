@@ -93,6 +93,7 @@ class FakeOllama:
         self.replies = iter(replies)
         self.show = show or {}
         self.requests: list[tuple[str, str, dict | None, float]] = []
+        self.streaming = FakeOllamaStream(self)
 
     @property
     def paths(self) -> list[str]:
@@ -122,3 +123,53 @@ class FakeOllama:
                 }
             return reply
         raise AssertionError(f"unexpected request {method} {path}")
+
+
+def ndjson(*objects: object) -> bytes:
+    import json
+
+    # Raw UTF-8 like Ollama sends, so multi-byte characters can be split across chunks.
+    return b"".join(json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n" for obj in objects)
+
+
+def ollama_chunks(*texts: str, done: dict | None = None, thinking: tuple[str, ...] = ()) -> bytes:
+    """An /api/chat NDJSON stream: thinking lines, content lines, then the done line."""
+    lines: list[dict] = [{"message": {"role": "assistant", "content": "", "thinking": t}}
+                         for t in thinking]
+    lines += [{"message": {"role": "assistant", "content": t}} for t in texts]
+    final = {"message": {"role": "assistant", "content": ""}, "done": True,
+             "done_reason": "stop", "prompt_eval_count": 7, "eval_count": 3,
+             "total_duration": 2_500_000_000, "load_duration": 500_000_000,
+             "eval_duration": 1_000_000_000}
+    lines.append({**final, **(done or {})})
+    return ndjson(*lines)
+
+
+class FakeOllamaStream:
+    """Stands in for the streaming transport: yields scripted byte chunks."""
+
+    def __init__(self, fake: "FakeOllama") -> None:
+        self.fake = fake
+        self.bodies: list[object] = []  # bytes, a list of byte chunks, or an exception
+        self.opened = 0
+        self.closed = 0
+
+    def __call__(self, method: str, url: str, payload: dict | None, timeout: float):
+        path = "/" + url.split("/", 3)[3]
+        self.fake.requests.append((method, path, payload, timeout))
+        body = self.bodies.pop(0) if self.bodies else ollama_chunks(
+            "local ", "stream ", f"{len(self.fake.chat_payloads)}"
+        )
+        if isinstance(body, BaseException):
+            raise body
+        return self._chunks([body] if isinstance(body, bytes) else body)
+
+    def _chunks(self, chunks: list):
+        self.opened += 1
+        try:
+            for chunk in chunks:
+                if isinstance(chunk, BaseException):
+                    raise chunk
+                yield chunk
+        finally:
+            self.closed += 1

@@ -5,13 +5,15 @@ Only models that run locally can be selected. Ollama also lists cloud models
 excluded. Models are never downloaded automatically.
 """
 
+import codecs
 import ipaddress
 import json
 import os
 import re
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import closing, contextmanager
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -23,7 +25,13 @@ from neurobrau_cli.providers.base import (
     GenerationResult,
     ModelInfo,
     ProviderError,
+    ReasoningDelta,
     ReasoningSupport,
+    StreamCompleted,
+    StreamEvent,
+    StreamFailed,
+    StreamIncomplete,
+    TextDelta,
     TokenUsage,
 )
 
@@ -37,6 +45,10 @@ THINK_TAGS = re.compile(r"^\s*<think>(.*?)</think>\s*", re.DOTALL)
 
 # transport(method, url, payload, timeout) -> parsed JSON; raises OllamaProviderError
 Transport = Callable[[str, str, dict[str, Any] | None, float], Any]
+# stream_transport(method, url, payload, timeout) -> raw byte chunks as they arrive.
+# Closing the iterator closes the connection. Raises OllamaProviderError.
+StreamTransport = Callable[[str, str, dict[str, Any] | None, float], Iterator[bytes]]
+STREAM_READ_SIZE = 8192
 
 
 class OllamaProviderError(ProviderError):
@@ -79,18 +91,54 @@ def is_loopback(url: str) -> bool:
         return False
 
 
-def urllib_transport(method: str, url: str, payload: dict[str, Any] | None, timeout: float) -> Any:
-    """Send one JSON request with the standard library and parse the JSON reply."""
+def open_request(method: str, url: str, payload: dict[str, Any] | None, timeout: float) -> Any:
+    """Open a JSON request with the standard library; returns the HTTP response."""
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url, data=data, method=method, headers={"Content-Type": "application/json"}
     )
     # Never route requests to a local server through an HTTP proxy.
     handlers = [urllib.request.ProxyHandler({})] if is_loopback(url) else []
-    opener = urllib.request.build_opener(*handlers)
-    try:
-        with opener.open(request, timeout=timeout) as response:
+    return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
+
+
+def urllib_transport(method: str, url: str, payload: dict[str, Any] | None, timeout: float) -> Any:
+    """Send one JSON request with the standard library and parse the JSON reply."""
+    with transport_errors(url):
+        with open_request(method, url, payload, timeout) as response:
             body = response.read()
+    try:
+        return json.loads(body.decode("utf-8"))
+    except ValueError as error:
+        raise invalid_response("reply is not valid JSON") from error
+
+
+def urllib_stream_transport(
+    method: str, url: str, payload: dict[str, Any] | None, timeout: float
+) -> Iterator[bytes]:
+    """Yield the response body in chunks as they arrive; the connection closes with the generator.
+
+    `timeout` applies to connecting and to each read, so a stalled stream fails
+    instead of hanging.
+    """
+    with transport_errors(url):
+        response = open_request(method, url, payload, timeout)
+    try:
+        while True:
+            with transport_errors(url):
+                chunk = response.read1(STREAM_READ_SIZE)
+            if not chunk:
+                return
+            yield chunk
+    finally:
+        response.close()
+
+
+@contextmanager
+def transport_errors(url: str) -> Iterator[None]:
+    """Turn urllib/socket exceptions into categorized OllamaProviderErrors."""
+    try:
+        yield
     except urllib.error.HTTPError as error:
         raise OllamaHTTPError(error.code, error_detail(error.read())) from error
     except TimeoutError as error:
@@ -107,10 +155,31 @@ def urllib_transport(method: str, url: str, payload: dict[str, Any] | None, time
             f"Connection to Ollama at {base_of(url)} failed: {error.strerror or error}",
             ErrorKind.CONNECTION,
         ) from error
+
+
+def iter_ndjson(chunks: Iterable[bytes]) -> Iterator[object]:
+    """Parse newline-delimited JSON from arbitrary byte chunks.
+
+    Bytes are buffered until a full line arrives, so a JSON object or a
+    multi-byte UTF-8 character split across chunks is decoded intact. Blank
+    lines are skipped. Raises OllamaProviderError for a line that is not JSON.
+    """
+    buffer = b""
+    for chunk in chunks:
+        buffer += chunk
+        *lines, buffer = buffer.split(b"\n")
+        for line in lines:
+            if line.strip():
+                yield parse_ndjson_line(line)
+    if buffer.strip():
+        yield parse_ndjson_line(buffer)
+
+
+def parse_ndjson_line(line: bytes) -> object:
     try:
-        return json.loads(body.decode("utf-8"))
+        return json.loads(codecs.decode(line, "utf-8"))
     except ValueError as error:
-        raise invalid_response("reply is not valid JSON") from error
+        raise invalid_response(f"stream line is not valid JSON: {line[:80]!r}") from error
 
 
 def base_of(url: str) -> str:
@@ -261,11 +330,13 @@ class OllamaProvider:
         self,
         base_url: str | None = None,
         transport: Transport | None = None,
+        stream_transport: StreamTransport | None = None,
         chat_timeout: float = CHAT_TIMEOUT,
         discovery_timeout: float = DISCOVERY_TIMEOUT,
     ) -> None:
         self.base_url = base_url or resolve_base_url()
         self.transport = transport or urllib_transport
+        self.stream_transport = stream_transport or urllib_stream_transport
         self.chat_timeout = chat_timeout
         self.discovery_timeout = discovery_timeout
         self._models: list[ModelInfo] | None = None  # everything /api/tags reported
@@ -367,12 +438,15 @@ class OllamaProvider:
 
     # ----- generation -----
 
-    def generate(self, messages: Sequence[Message], options: GenerationOptions) -> GenerationResult:
+    def chat_payload(
+        self, messages: Sequence[Message], options: GenerationOptions, stream: bool
+    ) -> tuple[ModelInfo, dict[str, Any]]:
+        """Validate the model and options; build the /api/chat body. Raises OllamaProviderError."""
         model = self.local_model(options.model)
         payload: dict[str, Any] = {
             "model": model.id,
             "messages": to_ollama_messages(messages, options.instructions),
-            "stream": False,
+            "stream": stream,
         }
         if "thinking" in self.capabilities(model):
             # Thinking is off unless another value is requested.
@@ -384,16 +458,152 @@ class OllamaProvider:
             )
         if options.max_output_tokens is not None:
             payload["options"] = {"num_predict": options.max_output_tokens}
+        return model, payload
+
+    def generate(self, messages: Sequence[Message], options: GenerationOptions) -> GenerationResult:
+        model, payload = self.chat_payload(messages, options, stream=False)
         try:
             data = self.request("POST", "/api/chat", payload, self.chat_timeout)
         except OllamaHTTPError as error:
-            if error.status == 404:
-                raise OllamaProviderError(
-                    f"Ollama model '{model.id}' was not found: {error.detail}. "
-                    f"Install it yourself with: ollama pull {model.id}"
-                ) from error
-            raise
+            raise explain_http_error(error, model.id) from error
         return parse_chat_response(data)
+
+    def stream(self, messages: Sequence[Message], options: GenerationOptions) -> Iterator[StreamEvent]:
+        """Stream /api/chat (`stream: true`) as events. The connection closes with the generator."""
+        try:
+            model, payload = self.chat_payload(messages, options, stream=True)
+        except ProviderError as error:
+            yield StreamFailed(error)
+            return
+        try:
+            chunks = self.stream_transport(
+                "POST", f"{self.base_url}/api/chat", payload, self.chat_timeout
+            )
+        except OllamaHTTPError as error:
+            yield StreamFailed(explain_http_error(error, model.id))
+            return
+        except ProviderError as error:
+            yield StreamFailed(error)
+            return
+        with closing(chunks):
+            yield from stream_chat_events(chunks, model.id)
+
+
+def explain_http_error(error: OllamaHTTPError, model_id: str) -> OllamaProviderError:
+    if error.status == 404:
+        return OllamaProviderError(
+            f"Ollama model '{model_id}' was not found: {error.detail}. "
+            f"Install it yourself with: ollama pull {model_id}"
+        )
+    return error
+
+
+class ThinkTagFilter:
+    """Hold back a leading `<think>…</think>` block that some models put in `content`."""
+
+    OPEN, CLOSE = "<think>", "</think>"
+
+    def __init__(self) -> None:
+        self.pending = ""
+        self.done = False  # past any leading think block
+
+    def feed(self, text: str) -> tuple[str, str]:
+        """Return (answer text, reasoning text) that can be emitted now."""
+        if self.done:
+            return text, ""
+        self.pending += text
+        stripped = self.pending.lstrip()
+        if self.OPEN.startswith(stripped):
+            return "", ""  # could still become "<think>"; wait for more
+        if not stripped.startswith(self.OPEN):
+            self.done = True
+            answer, self.pending = self.pending, ""
+            return answer, ""
+        end = stripped.find(self.CLOSE)
+        if end < 0:
+            return "", ""  # inside the think block
+        self.done = True
+        reasoning = stripped[len(self.OPEN):end].strip()
+        answer = stripped[end + len(self.CLOSE):].lstrip()
+        self.pending = ""
+        return answer, reasoning
+
+    def flush(self) -> str:
+        """Answer text still held back when the stream ends.
+
+        A partial tag such as "<th" was real text; an unclosed think block is
+        thinking and is never returned as the answer.
+        """
+        text, self.pending = self.pending, ""
+        return "" if text.lstrip().startswith(self.OPEN) else text
+
+
+def nanoseconds(value: object) -> float | None:
+    return value / 1e9 if isinstance(value, int) and value >= 0 else None
+
+
+def chunk_usage(data: dict[str, Any]) -> TokenUsage | None:
+    return parse_chat_response({"message": {"content": ""}, **data}).usage
+
+
+def stream_chat_events(chunks: Iterable[bytes], model_id: str) -> Iterator[StreamEvent]:
+    """Turn /api/chat NDJSON chunks into stream events."""
+    answer: list[str] = []
+    reasoning: list[str] = []
+    think_filter = ThinkTagFilter()
+    try:
+        for data in iter_ndjson(chunks):
+            if not isinstance(data, dict):
+                raise invalid_response("stream line is not a JSON object")
+            if isinstance(data.get("error"), str):
+                yield StreamFailed(OllamaProviderError(f"Ollama error: {data['error']}"), "".join(answer))
+                return
+            message = data.get("message", {})
+            if not isinstance(message, dict) or not isinstance(message.get("content", ""), str):
+                raise invalid_response("stream line has no valid 'message.content'")
+            thinking = message.get("thinking")
+            if isinstance(thinking, str) and thinking:
+                reasoning.append(thinking)
+                yield ReasoningDelta(thinking)
+            text, inline_reasoning = think_filter.feed(message.get("content", ""))
+            if inline_reasoning:
+                reasoning.append(inline_reasoning)
+                yield ReasoningDelta(inline_reasoning)
+            if text:
+                answer.append(text)
+                yield TextDelta(text)
+            if data.get("done") is True:
+                leftover = think_filter.flush()
+                if leftover:
+                    answer.append(leftover)
+                    yield TextDelta(leftover)
+                yield finish_event(data, "".join(answer), "".join(reasoning) or None, model_id)
+                return
+        yield StreamFailed(
+            OllamaProviderError("Ollama stream ended before the response was complete.",
+                                ErrorKind.CONNECTION),
+            "".join(answer),
+        )
+    except OllamaHTTPError as error:
+        yield StreamFailed(explain_http_error(error, model_id), "".join(answer))
+    except ProviderError as error:
+        yield StreamFailed(error, "".join(answer))
+
+
+def finish_event(
+    data: dict[str, Any], text: str, reasoning: str | None, model_id: str
+) -> StreamCompleted | StreamIncomplete:
+    usage = chunk_usage(data)
+    if data.get("done_reason") == "length":
+        return StreamIncomplete("the max output token limit was reached", text, usage)
+    metadata: dict[str, object] = {"model": data.get("model", model_id)}
+    for key in ("total_duration", "load_duration", "prompt_eval_duration", "eval_duration"):
+        seconds = nanoseconds(data.get(key))
+        if seconds is not None:
+            metadata[key.replace("_duration", "_seconds")] = seconds
+    if isinstance(data.get("done_reason"), str):
+        metadata["done_reason"] = data["done_reason"]
+    return StreamCompleted(GenerationResult(text, usage, reasoning), metadata)
 
 
 def no_local_models_message() -> str:

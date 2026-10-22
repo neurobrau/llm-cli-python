@@ -10,9 +10,18 @@ from typing import TextIO
 from neurobrau_cli import __version__, chat
 from neurobrau_cli.conversation import Message
 from neurobrau_cli.engine import ChatEngine
-from neurobrau_cli.formatting import format_transcript, format_usage
+from neurobrau_cli.formatting import format_stream_stats, format_transcript, format_usage
 from neurobrau_cli.providers import ollama_provider, openai_provider
-from neurobrau_cli.providers.base import ErrorKind, GenerationOptions, Provider, ProviderError
+from neurobrau_cli.providers.base import (
+    ErrorKind,
+    GenerationOptions,
+    Provider,
+    ProviderError,
+    StreamCompleted,
+    StreamFailed,
+    StreamIncomplete,
+    TextDelta,
+)
 from neurobrau_cli.preferences import Overrides, Preferences, resolve_model_settings
 from neurobrau_cli.session import ChatSession
 from neurobrau_cli.settings import (
@@ -31,6 +40,8 @@ DEFAULT_PROVIDER = "openai"
 EXIT_OK = 0
 EXIT_API_ERROR = 1
 EXIT_USAGE_ERROR = 2  # argparse's own exit code for invalid arguments
+EXIT_INCOMPLETE = 8  # streamed answer stopped early (e.g. token limit)
+EXIT_INTERRUPTED = 130
 EXIT_CODES: dict[ErrorKind, int] = {
     ErrorKind.API: EXIT_API_ERROR,
     ErrorKind.MISSING_API_KEY: 3,
@@ -115,6 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="print token usage to stderr after each response",
     )
     parser.add_argument(
+        "--stream",
+        action="store_true",
+        help=(
+            "print the answer while it is generated (one-shot and --plain chat; "
+            "the fullscreen interface does not stream yet)"
+        ),
+    )
+    parser.add_argument(
         "--plain",
         action="store_true",
         help="use the line-oriented chat instead of the fullscreen interface",
@@ -186,6 +205,15 @@ def run_prompt(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
         )
         for note in [*warnings, *notices]:
             print(f"{PROG_NAME}: note: {note}", file=stderr)
+        if args.stream:
+            options = GenerationOptions(
+                model=model,
+                reasoning_effort=resolved.reasoning,
+                max_output_tokens=resolved.max_output_tokens,
+                instructions=instructions,
+                reasoning_explicit=resolved.reasoning_explicit,
+            )
+            return stream_prompt(provider, args, options, stdout, stderr)
         if provider_name == "openai":
             extra = {"instructions": instructions} if instructions else {}
             result = openai_provider.generate_text(
@@ -213,6 +241,53 @@ def run_prompt(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
     if args.usage:
         print(format_usage(result.usage), file=stderr)
     return EXIT_OK
+
+
+def stream_prompt(
+    provider: Provider,
+    args: argparse.Namespace,
+    options: GenerationOptions,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    """One-shot streaming: print text as it arrives, then usage on success."""
+    events = provider.stream([Message("user", args.prompt)], options)
+    printed = False
+    try:
+        for event in events:
+            if isinstance(event, TextDelta):
+                stdout.write(event.text)
+                stdout.flush()
+                printed = True
+            elif isinstance(event, (StreamCompleted, StreamIncomplete, StreamFailed)):
+                break
+        else:
+            event = StreamFailed(ProviderError("The response stream ended without a result."))
+    except KeyboardInterrupt:
+        if printed:
+            print(file=stdout, flush=True)
+        print(f"{PROG_NAME}: interrupted", file=stderr)
+        return EXIT_INTERRUPTED
+    finally:
+        close = getattr(events, "close", None)
+        if close is not None:
+            close()  # releases the network connection
+
+    if printed or isinstance(event, StreamCompleted):
+        print(file=stdout, flush=True)  # before any stderr message
+    if isinstance(event, StreamCompleted):
+        if args.usage:
+            print(format_usage(event.result.usage), file=stderr)
+            stats = format_stream_stats(event.metadata)
+            if stats:
+                print(stats, file=stderr)
+        return EXIT_OK
+    if isinstance(event, StreamIncomplete):
+        print(f"{PROG_NAME}: warning: response incomplete: {event.reason}.", file=stderr)
+        if args.usage and event.usage:
+            print(format_usage(event.usage), file=stderr)
+        return EXIT_INCOMPLETE
+    return report(event.error, stderr)
 
 
 def run_interactive(args: argparse.Namespace) -> int:
@@ -253,7 +328,10 @@ def run_interactive(args: argparse.Namespace) -> int:
                 print(format_transcript(session.messages))
             return exit_code
     chat.enable_line_editing()
-    return chat.run_chat(settings, engine.reply, input_fn=input, session=session)
+    stream_fn = engine.stream if args.stream else None
+    return chat.run_chat(
+        settings, engine.reply, input_fn=input, session=session, stream_fn=stream_fn
+    )
 
 
 def display_settings(engine: ChatEngine, show_usage: bool) -> chat.ChatSettings:

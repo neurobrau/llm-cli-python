@@ -678,3 +678,90 @@ or `warning: …` (plain chat), or shown as entries in the TUI.
 
 Changing F4/F5 saves `reasoning` / `max_output_tokens` for the current
 provider/model; F6 saves `answer_style`.
+
+## 14. Streaming (`--stream`)
+
+The fullscreen UI does not stream yet; this section covers the shared
+engine used by one-shot and plain-chat mode.
+
+### Events
+
+A provider stream yields, in order:
+
+| Event | Fields | Meaning |
+|---|---|---|
+| `TextDelta` | `text` | a piece of the answer (empty pieces are dropped) |
+| `ReasoningDelta` | `text` | a piece of thinking; never printed or saved as the answer |
+| `StreamCompleted` | `result` (`text`, `usage`, `reasoning`), `metadata` | finished; `text` is the concatenated deltas |
+| `StreamIncomplete` | `reason`, `partial_text`, `usage` | stopped early (token limit, content filter) |
+| `StreamFailed` | `error` (with kind/exit code), `partial_text` | request or stream failed |
+
+Exactly one of the last three ends every stream; failures are events, not
+exceptions. Closing the stream early (Ctrl+C, consumer stops) closes the
+HTTP connection.
+
+### OpenAI
+
+`responses.create(..., stream=True)` with the same request as
+non-streaming (`store=false`, instructions, reasoning, max output tokens).
+
+| SDK event | Result |
+|---|---|
+| `response.output_text.delta` | `TextDelta(delta)`; a non-string delta → `StreamFailed("Invalid stream event from OpenAI: …")` |
+| `response.completed` | `StreamCompleted`; text = deltas (or `response.output_text` if none arrived); usage from `response.usage`; metadata `response_id`, `model` |
+| `response.incomplete` | `StreamIncomplete`; reason `max_output_tokens` → `the max output token limit was reached`, `content_filter` → `the content filter stopped the response`, otherwise the raw reason |
+| `response.failed` | `StreamFailed("OpenAI response failed: <response.error.message>")` |
+| `error` | `StreamFailed("OpenAI stream error: <message>")` |
+| anything else | ignored |
+| end without a terminal event | `StreamFailed("OpenAI stream ended before the response was complete.")` |
+
+SDK exceptions (before or during the stream) map to the usual error kinds.
+The rejected-reasoning rule from section 12 applies when the rejection
+arrives before any text.
+
+### Ollama
+
+`POST /api/chat` with `"stream": true` and otherwise the same body as
+non-streaming (same model checks; cloud models refused before any request).
+The body is newline-delimited JSON, read in raw byte chunks: bytes are
+buffered until a newline, so lines and multi-byte UTF-8 characters split
+across chunks are decoded intact; blank lines are skipped; the read timeout
+(300 s) applies to each read.
+
+| Line | Result |
+|---|---|
+| `message.thinking` (non-empty) | `ReasoningDelta` |
+| `message.content` (non-empty) | `TextDelta`, except a leading `<think>…</think>` block, which becomes reasoning (held back until it is clear whether the text starts such a block) |
+| `{"error": "…"}` | `StreamFailed("Ollama error: …")` |
+| `"done": true`, `done_reason` `length` | `StreamIncomplete("the max output token limit was reached")` with usage |
+| `"done": true`, otherwise | `StreamCompleted`; usage from `prompt_eval_count` / `eval_count`; metadata `model`, `done_reason`, and `total_seconds`, `load_seconds`, `prompt_eval_seconds`, `eval_seconds` (from the `*_duration` nanoseconds) |
+| not JSON / not an object / `message.content` not a string | `StreamFailed("Invalid response from Ollama: …")` |
+| end without `done` | `StreamFailed("Ollama stream ended before the response was complete.")` (connection kind) |
+
+HTTP errors map as in section 12 (404 → install hint).
+
+### Output
+
+One-shot: deltas are written to stdout and flushed immediately; a final
+newline follows any text (flushed before anything goes to stderr).
+
+| Outcome | stderr | Exit |
+|---|---|---|
+| completed | with `--usage`: `Token usage: …` then, if durations are known, `Duration: <total> s (load <l> s, generation <g> s)` | 0 |
+| incomplete | `neurobrau: warning: response incomplete: <reason>.` (+ usage with `--usage`) | 8 |
+| failed | `neurobrau: error: <message>` | error kind code |
+| Ctrl+C | `neurobrau: interrupted` | 130 |
+
+Plain chat: `AI > ` is printed with the first piece of text (an empty
+completed answer still prints it), then the text as it arrives. Incomplete:
+`warning: Response incomplete: <reason>. The partial response was not saved.`;
+failed: `error: <message>` plus the same suffix when text had been shown;
+Ctrl+C: `Request cancelled. The partial response was not saved.` and the
+chat continues.
+
+### Conversation state
+
+The user/assistant pair is committed, and the conversation saved, only after
+`StreamCompleted`, using the assembled text. Incomplete, failed and
+interrupted answers leave the conversation and its file unchanged, and are
+not sent as context later.

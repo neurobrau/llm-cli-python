@@ -391,3 +391,199 @@ def test_rejected_default_marks_model_as_without_reasoning() -> None:
     provider.generate([Message("user", "Hi")], GenerationOptions("gpt-6-luna", "none"))
 
     assert provider.reasoning_support("gpt-6-luna").values == ()
+
+
+# ----- Task 008a: Responses API streaming -----
+
+from neurobrau_cli.providers.base import (  # noqa: E402
+    ReasoningDelta,
+    StreamCompleted,
+    StreamFailed,
+    StreamIncomplete,
+    TextDelta,
+)
+
+
+class FakeSDKStream:
+    """Iterable of SDK-like events with close(), like openai.Stream."""
+
+    def __init__(self, events: list[object]) -> None:
+        self.events = events
+        self.closed = False
+
+    def __iter__(self):
+        for event in self.events:
+            if isinstance(event, BaseException):
+                raise event
+            yield event
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def delta(text: object) -> SimpleNamespace:
+    return SimpleNamespace(type="response.output_text.delta", delta=text)
+
+
+def completed(output_text: str = "", usage: object = None) -> SimpleNamespace:
+    response = SimpleNamespace(id="resp_1", model="gpt-x", output_text=output_text, usage=usage)
+    return SimpleNamespace(type="response.completed", response=response)
+
+
+USAGE = SimpleNamespace(input_tokens=5, output_tokens=7, total_tokens=12)
+
+
+def streaming_client(*events: object) -> tuple[MagicMock, FakeSDKStream]:
+    stream = FakeSDKStream(list(events))
+    client = MagicMock()
+    client.responses.create.return_value = stream
+    return client, stream
+
+
+def run_stream(client: MagicMock, options: GenerationOptions | None = None) -> list[object]:
+    provider = openai_provider.OpenAIProvider(client)
+    return list(provider.stream([Message("user", "Hi")], options or GenerationOptions("gpt-x")))
+
+
+def test_stream_yields_deltas_then_completion_with_usage() -> None:
+    client, stream = streaming_client(
+        SimpleNamespace(type="response.created"), delta("Hel"), delta(""), delta("lo, "),
+        delta("Grüße 👋"), completed(usage=USAGE),
+    )
+
+    events = run_stream(client)
+
+    assert events[:3] == [TextDelta("Hel"), TextDelta("lo, "), TextDelta("Grüße 👋")]
+    final = events[3]
+    assert isinstance(final, StreamCompleted)
+    assert final.result.text == "Hello, Grüße 👋"
+    assert final.result.usage == TokenUsage(5, 7, 12)
+    assert final.metadata == {"response_id": "resp_1", "model": "gpt-x"}
+    assert stream.closed
+
+
+def test_stream_request_keeps_all_settings() -> None:
+    client, _ = streaming_client(completed())
+    options = GenerationOptions("gpt-x", "low", 64, instructions="Be brief.", reasoning_explicit=True)
+
+    run_stream(client, options)
+
+    client.responses.create.assert_called_once_with(
+        model="gpt-x",
+        input=[{"role": "user", "content": "Hi"}],
+        instructions="Be brief.",
+        reasoning={"effort": "low"},
+        store=False,
+        max_output_tokens=64,
+        stream=True,
+    )
+
+
+def test_completion_without_deltas_uses_output_text() -> None:
+    client, _ = streaming_client(completed(output_text="Whole answer"))
+
+    assert run_stream(client)[-1].result.text == "Whole answer"
+
+
+def test_incomplete_response() -> None:
+    response = SimpleNamespace(incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                               usage=USAGE)
+    client, stream = streaming_client(
+        delta("Partial"), SimpleNamespace(type="response.incomplete", response=response)
+    )
+
+    final = run_stream(client)[-1]
+
+    assert final == StreamIncomplete("the max output token limit was reached", "Partial",
+                                     TokenUsage(5, 7, 12))
+    assert stream.closed
+
+
+@pytest.mark.parametrize(
+    ("event", "message"),
+    [
+        (SimpleNamespace(type="response.failed",
+                         response=SimpleNamespace(error=SimpleNamespace(message="server overloaded"))),
+         "OpenAI response failed: server overloaded"),
+        (SimpleNamespace(type="error", message="rate limited", code="rate_limit"),
+         "OpenAI stream error: rate limited"),
+        (delta(None), "Invalid stream event from OpenAI"),
+    ],
+)
+def test_failure_events(event: object, message: str) -> None:
+    client, stream = streaming_client(delta("So far"), event, delta("never"))
+
+    events = run_stream(client)
+
+    assert events[0] == TextDelta("So far")
+    assert isinstance(events[-1], StreamFailed)
+    assert message in str(events[-1].error)
+    assert events[-1].partial_text == "So far"
+    assert len(events) == 2 and stream.closed
+
+
+def test_stream_ending_without_terminal_event_fails() -> None:
+    client, _ = streaming_client(delta("cut"))
+
+    final = run_stream(client)[-1]
+
+    assert isinstance(final, StreamFailed)
+    assert "ended before the response was complete" in str(final.error)
+
+
+def test_sdk_error_during_stream_is_translated() -> None:
+    client, stream = streaming_client(delta("a"), openai.APIConnectionError(request=REQUEST))
+
+    final = run_stream(client)[-1]
+
+    assert final.error.kind is ErrorKind.CONNECTION
+    assert final.partial_text == "a"
+    assert stream.closed
+
+
+def test_errors_before_streaming_starts() -> None:
+    client = MagicMock()
+    client.responses.create.side_effect = make_status_error(openai.AuthenticationError, 401, "bad")
+
+    assert run_stream(client)[-1].error.kind is ErrorKind.AUTHENTICATION
+    no_key = list(openai_provider.OpenAIProvider().stream([Message("user", "Hi")],
+                                                          GenerationOptions("gpt-x")))
+    assert no_key[-1].error.kind is ErrorKind.MISSING_API_KEY
+
+
+def test_closing_early_closes_the_sdk_stream() -> None:
+    client, stream = streaming_client(delta("a"), delta("b"), completed())
+    events = openai_provider.OpenAIProvider(client).stream([Message("user", "Hi")],
+                                                           GenerationOptions("gpt-x"))
+
+    assert next(events) == TextDelta("a")
+    events.close()
+
+    assert stream.closed
+
+
+def reasoning_rejection() -> openai.BadRequestError:
+    error = make_status_error(openai.BadRequestError, 400, "Unsupported parameter")
+    error.param = "reasoning.effort"
+    return error
+
+
+def test_stream_retries_without_rejected_default_reasoning() -> None:
+    client = MagicMock()
+    retry_stream = FakeSDKStream([delta("ok"), completed()])
+    client.responses.create.side_effect = [reasoning_rejection(), retry_stream]
+
+    events = run_stream(client, GenerationOptions("gpt-x", "none"))
+
+    assert events[-1].result.text == "ok"
+    assert "reasoning" not in client.responses.create.call_args_list[1].kwargs
+
+
+def test_stream_reports_rejected_explicit_reasoning() -> None:
+    client = MagicMock()
+    client.responses.create.side_effect = reasoning_rejection()
+
+    events = run_stream(client, GenerationOptions("gpt-x", "high", reasoning_explicit=True))
+
+    assert "does not accept reasoning effort 'high'" in str(events[-1].error)
+    assert client.responses.create.call_count == 1

@@ -501,3 +501,280 @@ def test_answer_style_is_a_system_message_for_this_request_only() -> None:
         {"role": "assistant", "content": "Hello!"},
         {"role": "user", "content": "More?"},
     ]
+
+
+# ----- Task 008a: /api/chat streaming -----
+
+from neurobrau_cli.providers.base import (  # noqa: E402
+    ReasoningDelta,
+    StreamCompleted,
+    StreamFailed,
+    StreamIncomplete,
+    TextDelta,
+)
+
+from fakes import ndjson, ollama_chunks  # noqa: E402
+
+
+def streaming_provider(fake: FakeOllama | None = None) -> tuple[OllamaProvider, FakeOllama]:
+    fake = fake or FakeOllama()
+    provider = OllamaProvider(
+        base_url="http://127.0.0.1:11434", transport=fake, stream_transport=fake.streaming
+    )
+    return provider, fake
+
+
+def stream_events(provider: OllamaProvider, **options: object) -> list[object]:
+    return list(provider.stream([Message("user", "Hi")],
+                                GenerationOptions(**{"model": "qwen3.5:4b", **options})))
+
+
+def test_iter_ndjson_handles_arbitrary_chunk_boundaries() -> None:
+    body = ndjson({"a": "Grüße"}, {"b": "日本語 👋"}) + b"\n" + ndjson({"c": 3})
+    for size in (1, 2, 3, 5, 7, len(body)):
+        chunks = [body[i:i + size] for i in range(0, len(body), size)]
+
+        assert list(ollama_provider.iter_ndjson(chunks)) == [
+            {"a": "Grüße"}, {"b": "日本語 👋"}, {"c": 3}
+        ]
+
+
+def test_iter_ndjson_accepts_last_line_without_newline() -> None:
+    assert list(ollama_provider.iter_ndjson([b'{"a": 1}\n{"b"', b": 2}"])) == [{"a": 1}, {"b": 2}]
+
+
+def test_iter_ndjson_rejects_malformed_line() -> None:
+    with pytest.raises(OllamaProviderError, match="stream line is not valid JSON"):
+        list(ollama_provider.iter_ndjson([b'{"a": 1}\n{oops}\n']))
+
+
+def test_stream_multiple_chunks_and_completion() -> None:
+    provider, fake = streaming_provider()
+    fake.streaming.bodies = [ollama_chunks("Hel", "", "lo ", "wörld")]
+
+    events = stream_events(provider)
+
+    assert events[:3] == [TextDelta("Hel"), TextDelta("lo "), TextDelta("wörld")]
+    final = events[3]
+    assert isinstance(final, StreamCompleted)
+    assert final.result.text == "Hello wörld"
+    assert final.result.usage == ollama_provider.TokenUsage(7, 3, 10)
+    assert final.metadata == {"model": "qwen3.5:4b", "total_seconds": 2.5, "load_seconds": 0.5,
+                              "eval_seconds": 1.0, "done_reason": "stop"}
+    assert fake.streaming.closed == 1
+
+
+def test_unicode_split_across_network_chunks() -> None:
+    provider, fake = streaming_provider()
+    body = ollama_chunks("Grüß ", "Gott 👋")
+    cut = body.index("ü".encode()) + 1  # in the middle of a two-byte character
+    fake.streaming.bodies = [[body[:cut], body[cut:cut + 3], body[cut + 3:]]]
+
+    final = stream_events(provider)[-1]
+
+    assert final.result.text == "Grüß Gott 👋"
+
+
+def test_stream_request_keeps_settings() -> None:
+    provider, fake = streaming_provider()
+
+    stream_events(provider, reasoning_effort="on", reasoning_explicit=True,
+                  max_output_tokens=50, instructions="Be brief.")
+
+    payload = fake.chat_payloads[0]
+    assert payload["stream"] is True
+    assert payload["think"] is True
+    assert payload["options"] == {"num_predict": 50}
+    assert payload["messages"][0] == {"role": "system", "content": "Be brief."}
+    assert fake.requests[-1][3] == ollama_provider.CHAT_TIMEOUT
+
+
+def test_thinking_is_separate_from_answer() -> None:
+    provider, fake = streaming_provider()
+    fake.streaming.bodies = [ollama_chunks("42", thinking=("Six times ", "seven."))]
+
+    events = stream_events(provider)
+
+    assert [e for e in events if isinstance(e, ReasoningDelta)] == [
+        ReasoningDelta("Six times "), ReasoningDelta("seven.")
+    ]
+    assert [e.text for e in events if isinstance(e, TextDelta)] == ["42"]
+    assert (events[-1].result.text, events[-1].result.reasoning) == ("42", "Six times seven.")
+
+
+def test_inline_think_block_split_across_chunks_is_not_answer() -> None:
+    provider, fake = streaming_provider()
+    fake.streaming.bodies = [ollama_chunks("<thi", "nk>Let me ", "add.</thi", "nk>\n\nThe answer", " is 5.")]
+
+    events = stream_events(provider)
+
+    assert "".join(e.text for e in events if isinstance(e, TextDelta)) == "The answer is 5."
+    assert events[-1].result.reasoning == "Let me add."
+
+
+def test_text_starting_like_a_tag_is_kept() -> None:
+    provider, fake = streaming_provider()
+    fake.streaming.bodies = [ollama_chunks("<", "html> is a tag")]
+
+    assert stream_events(provider)[-1].result.text == "<html> is a tag"
+
+
+def test_token_limit_gives_incomplete_event() -> None:
+    provider, fake = streaming_provider()
+    fake.streaming.bodies = [ollama_chunks("Once upon", done={"done_reason": "length"})]
+
+    final = stream_events(provider)[-1]
+
+    assert final == StreamIncomplete("the max output token limit was reached", "Once upon",
+                                     ollama_provider.TokenUsage(7, 3, 10))
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (ndjson({"message": {"content": "Hi"}}, {"error": "model crashed"}), "Ollama error: model crashed"),
+        (ndjson({"message": {"content": "Hi"}}) + b"not json\n", "stream line is not valid JSON"),
+        (ndjson({"message": {"content": "Hi"}}, [1, 2]), "not a JSON object"),
+        (ndjson({"message": {"content": "Hi"}}, {"message": {"content": 5}}), "no valid 'message.content'"),
+        (ndjson({"message": {"content": "Hi"}}), "ended before the response was complete"),
+    ],
+)
+def test_stream_failures_keep_partial_text(body: bytes, message: str) -> None:
+    provider, fake = streaming_provider()
+    fake.streaming.bodies = [body]
+
+    events = stream_events(provider)
+
+    assert isinstance(events[-1], StreamFailed)
+    assert message in str(events[-1].error)
+    assert events[-1].partial_text == "Hi"
+    assert fake.streaming.closed == 1
+
+
+def test_transport_errors_become_failed_events() -> None:
+    provider, fake = streaming_provider()
+    fake.streaming.bodies = [
+        OllamaHTTPError(404, "model 'qwen3.5:4b' not found"),
+        [ollama_chunks("partial")[:20], OllamaProviderError("Request to Ollama timed out.", ErrorKind.TIMEOUT)],
+    ]
+
+    not_found = stream_events(provider)[-1]
+    timed_out = stream_events(provider)[-1]
+
+    assert "ollama pull qwen3.5:4b" in str(not_found.error)
+    assert timed_out.error.kind is ErrorKind.TIMEOUT
+    assert fake.streaming.closed == 1  # the stream that was opened got closed
+
+
+def test_stream_refuses_cloud_models_without_requests() -> None:
+    provider, fake = streaming_provider()
+
+    events = list(provider.stream([Message("user", "Hi")], GenerationOptions("glm-4.7:cloud")))
+
+    assert "cloud model" in str(events[-1].error)
+    assert fake.paths == ["/api/tags"]
+    assert fake.streaming.opened == 0
+
+
+def test_closing_early_closes_the_connection() -> None:
+    provider, fake = streaming_provider()
+    fake.streaming.bodies = [[ndjson({"message": {"content": "a"}}), ndjson({"message": {"content": "b"}}),
+                              ollama_chunks()]]
+    events = provider.stream([Message("user", "Hi")], GenerationOptions("qwen3.5:4b"))
+
+    assert next(events) == TextDelta("a")
+    events.close()
+
+    assert fake.streaming.closed == 1
+
+
+def test_interrupt_during_stream_closes_connection() -> None:
+    provider, fake = streaming_provider()
+    fake.streaming.bodies = [[ndjson({"message": {"content": "a"}}), KeyboardInterrupt()]]
+
+    with pytest.raises(KeyboardInterrupt):
+        stream_events(provider)
+
+    assert fake.streaming.closed == 1
+
+
+# ----- real streaming transport against a local test server -----
+
+
+class ChunkedHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    chunks: list[tuple[bytes, float]] = []
+    status = 200
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(self.status)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            for data, delay in self.chunks:
+                time.sleep(delay)
+                self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+@pytest.fixture
+def chunked_server() -> Iterator[str]:
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ChunkedHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def test_stream_transport_yields_chunks_as_they_arrive(chunked_server: str) -> None:
+    ChunkedHandler.status = 200
+    ChunkedHandler.chunks = [(b'{"message": {"content": "A"}}\n', 0), (b'{"message": {"content": "B"}}\n', 0.3)]
+    chunks = ollama_provider.urllib_stream_transport("POST", f"{chunked_server}/api/chat", {}, 2)
+
+    started = time.monotonic()
+    first = next(chunks)
+    first_delay = time.monotonic() - started
+    rest = b"".join(chunks)
+
+    assert first.startswith(b'{"message": {"content": "A"}}')
+    assert first_delay < 0.25  # did not wait for the whole body
+    assert b'"B"' in first + rest
+
+
+def test_stream_transport_read_timeout(chunked_server: str) -> None:
+    ChunkedHandler.status = 200
+    ChunkedHandler.chunks = [(b'{"message": {"content": "A"}}\n', 0), (b"{}\n", 1.0)]
+    chunks = ollama_provider.urllib_stream_transport("POST", f"{chunked_server}/api/chat", {}, 0.3)
+
+    next(chunks)
+    with pytest.raises(ProviderError) as exc_info:
+        list(chunks)
+
+    assert exc_info.value.kind is ErrorKind.TIMEOUT
+
+
+def test_stream_transport_http_error(server: str) -> None:
+    Handler.routes = {"/api/chat": (404, b'{"error": "model not found"}', 0)}
+
+    with pytest.raises(OllamaHTTPError):
+        next(ollama_provider.urllib_stream_transport("POST", f"{server}/api/chat", {}, 2))
+
+
+def test_end_to_end_stream_over_http(chunked_server: str) -> None:
+    ChunkedHandler.status = 200
+    body = ollama_chunks("Grüß ", "Gott")
+    ChunkedHandler.chunks = [(body[i:i + 9], 0) for i in range(0, len(body), 9)]
+    provider = OllamaProvider(base_url=chunked_server, transport=FakeOllama())
+
+    final = list(provider.stream([Message("user", "Hi")], GenerationOptions("qwen3.5:4b")))[-1]
+
+    assert final.result.text == "Grüß Gott"

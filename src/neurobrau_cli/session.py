@@ -4,12 +4,21 @@ Wraps the in-memory `Conversation` with session metadata and optional
 persistence. UIs call these methods; they never touch the filesystem directly.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
 from neurobrau_cli.conversation import Conversation, Message
-from neurobrau_cli.providers.openai_provider import GenerationResult
+from neurobrau_cli.providers.base import (
+    GenerationResult,
+    ProviderError,
+    ReasoningDelta,
+    StreamCompleted,
+    StreamEvent,
+    StreamFailed,
+    TerminalEvent,
+    TextDelta,
+)
 from neurobrau_cli.storage import (
     HistoryError,
     HistoryStore,
@@ -19,6 +28,8 @@ from neurobrau_cli.storage import (
 )
 
 ReplyFn = Callable[[Sequence[Message]], GenerationResult]
+StreamFn = Callable[[Sequence[Message]], Iterator[StreamEvent]]
+DeltaHandler = Callable[[TextDelta | ReasoningDelta], None]
 Clock = Callable[[], datetime]
 
 # Files written before provider selection existed have no provider/model;
@@ -59,6 +70,32 @@ def exchange(conversation: Conversation, text: str, reply_fn: ReplyFn) -> Genera
     result = reply_fn(conversation.with_user_message(text))
     conversation.commit_exchange(text, result.text)
     return result
+
+
+def stream_exchange(
+    conversation: Conversation, text: str, stream_fn: StreamFn, on_delta: DeltaHandler
+) -> TerminalEvent:
+    """Stream a reply to `text` with prior context; commit only a completed answer.
+
+    Deltas go to `on_delta` as they arrive. The assembled answer is committed
+    with the user message only on StreamCompleted; incomplete or failed
+    replies, and KeyboardInterrupt, leave the history unchanged. The stream
+    is always closed, which releases its network connection.
+    """
+    events = stream_fn(conversation.with_user_message(text))
+    try:
+        for event in events:
+            if isinstance(event, (TextDelta, ReasoningDelta)):
+                on_delta(event)
+                continue
+            if isinstance(event, StreamCompleted):
+                conversation.commit_exchange(text, event.result.text)
+            return event
+        return StreamFailed(ProviderError("The response stream ended without a result."))
+    finally:
+        close = getattr(events, "close", None)
+        if close is not None:
+            close()
 
 
 class ChatSession:
@@ -138,6 +175,17 @@ class ChatSession:
         """
         result = exchange(self.conversation, text, reply_fn)
         return result, self.save()
+
+    def send_stream(
+        self, text: str, stream_fn: StreamFn, on_delta: DeltaHandler
+    ) -> tuple[TerminalEvent, str | None]:
+        """Streaming `send`: returns the terminal event and a save warning, if any.
+
+        Only a completed answer is committed and saved.
+        """
+        terminal = stream_exchange(self.conversation, text, stream_fn, on_delta)
+        warning = self.save() if isinstance(terminal, StreamCompleted) else None
+        return terminal, warning
 
     def reset(self) -> str | None:
         """Start a new empty conversation; the previous one stays on disk.

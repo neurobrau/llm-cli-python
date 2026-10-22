@@ -390,3 +390,141 @@ def test_save_failure_is_reported_without_traceback(
     assert "AI > reply 1" in captured.out
     assert "warning: Could not save conversation history" in captured.err
     assert "Traceback" not in captured.err
+
+
+# ----- Task 008a: streaming in the plain chat -----
+
+from neurobrau_cli.providers.base import (  # noqa: E402
+    ProviderError,
+    ReasoningDelta,
+    StreamCompleted,
+    StreamFailed,
+    StreamIncomplete,
+    TextDelta,
+)
+
+
+class StreamingModel:
+    """Stream function with scripted events per turn; records history and timing of output."""
+
+    def __init__(self, *turns: list[object], stdout_probe: object = None) -> None:
+        self.turns = list(turns)
+        self.calls: list[list[Message]] = []
+
+    def __call__(self, messages: Sequence[Message]):
+        self.calls.append(list(messages))
+        script = self.turns.pop(0) if self.turns else [TextDelta("ok"), StreamCompleted(GenerationResult("ok"))]
+        return iter_events(script)
+
+
+def iter_events(script: list[object]):
+    for event in script:
+        if isinstance(event, BaseException):
+            raise event
+        yield event
+
+
+def completed(text: str, usage: TokenUsage | None = None, **metadata: object) -> StreamCompleted:
+    return StreamCompleted(GenerationResult(text, usage), metadata)
+
+
+def run_streaming(lines: list[object], model: StreamingModel, settings: ChatSettings = SETTINGS,
+                  session: ChatSession | None = None) -> int:
+    return run_chat(settings, FakeModel(), input_fn=scripted_input(lines),
+                    session=session, stream_fn=model)
+
+
+def test_streamed_reply_is_printed_with_prefix(capsys: pytest.CaptureFixture[str]) -> None:
+    model = StreamingModel([TextDelta("Hel"), ReasoningDelta("hmm"), TextDelta("lo!"), completed("Hello!")])
+
+    run_streaming(["Hi"], model)
+
+    out = capsys.readouterr().out
+    assert "AI > Hello!\n" in out
+    assert "hmm" not in out
+
+
+def test_streamed_turns_keep_history() -> None:
+    model = StreamingModel([TextDelta("A1"), completed("A1")], [TextDelta("A2"), completed("A2")])
+    session = ChatSession()
+
+    run_streaming(["Q1", "Q2"], model, session=session)
+
+    assert [m.content for m in model.calls[1]] == ["Q1", "A1", "Q2"]
+    assert [m.content for m in session.messages] == ["Q1", "A1", "Q2", "A2"]
+
+
+def test_streamed_usage_and_duration(capsys: pytest.CaptureFixture[str]) -> None:
+    model = StreamingModel([TextDelta("x"), completed("x", TokenUsage(3, 1, 4), total_seconds=1.5,
+                                                       load_seconds=0.25, eval_seconds=1.0)])
+
+    run_streaming(["Hi"], model, ChatSettings("ollama", "m", show_usage=True))
+
+    err = capsys.readouterr().err
+    assert "Token usage: input=3, output=1, total=4\n" in err
+    assert "Duration: 1.50 s (load 0.25 s, generation 1.00 s)\n" in err
+
+
+def test_incomplete_stream_is_reported_and_not_saved(capsys: pytest.CaptureFixture[str]) -> None:
+    model = StreamingModel([TextDelta("Once"), StreamIncomplete("the max output token limit was reached", "Once")],
+                           [TextDelta("ok"), completed("ok")])
+    session = ChatSession()
+
+    run_streaming(["Story", "Next"], model, session=session)
+
+    captured = capsys.readouterr()
+    assert "AI > Once\n" in captured.out
+    assert ("warning: Response incomplete: the max output token limit was reached. "
+            "The partial response was not saved.") in captured.err
+    assert [m.content for m in model.calls[1]] == ["Next"]  # the partial answer is not context
+    assert [m.content for m in session.messages] == ["Next", "ok"]
+
+
+def test_failed_stream_after_partial_text(capsys: pytest.CaptureFixture[str]) -> None:
+    failure = StreamFailed(ProviderError("Could not connect to Ollama."), "Par")
+    model = StreamingModel([TextDelta("Par"), failure])
+
+    run_streaming(["Hi"], model)
+
+    captured = capsys.readouterr()
+    assert "AI > Par\n" in captured.out
+    assert "error: Could not connect to Ollama. The partial response was not saved." in captured.err
+
+
+def test_immediate_failure_prints_no_prefix(capsys: pytest.CaptureFixture[str]) -> None:
+    model = StreamingModel([StreamFailed(ProviderError("OPENAI_API_KEY is not set."))])
+
+    run_streaming(["Hi"], model)
+
+    captured = capsys.readouterr()
+    assert "AI >" not in captured.out
+    assert "error: OPENAI_API_KEY is not set.\n" in captured.err
+
+
+def test_ctrl_c_during_stream_cancels_and_continues(capsys: pytest.CaptureFixture[str]) -> None:
+    model = StreamingModel([TextDelta("Par"), KeyboardInterrupt()], [TextDelta("ok"), completed("ok")])
+    session = ChatSession()
+
+    exit_code = run_streaming(["Hi", "Again"], model, session=session)
+
+    assert exit_code == 0
+    assert "Request cancelled. The partial response was not saved." in capsys.readouterr().err
+    assert [m.content for m in session.messages] == ["Again", "ok"]
+
+
+def test_streaming_text_is_flushed_as_it_arrives() -> None:
+    writes: list[tuple[str, bool]] = []
+
+    class Out:
+        def write(self, text: str) -> None:
+            writes.append((text, False))
+
+        def flush(self) -> None:
+            if writes:
+                writes[-1] = (writes[-1][0], True)
+
+    model = StreamingModel([TextDelta("a"), TextDelta("b"), completed("ab")])
+    run_chat(SETTINGS, FakeModel(), input_fn=scripted_input(["Hi"]), stdout=Out(), stderr=Out(),
+             stream_fn=model)
+
+    assert ("a", True) in writes and ("b", True) in writes

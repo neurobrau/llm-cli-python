@@ -5,8 +5,8 @@ checks whether it can be used, lists its models, and raises `ProviderError`
 with a normalized `ErrorKind` for every failure.
 """
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
 
@@ -100,6 +100,57 @@ class ReasoningSupport:
         return bool(self.values)
 
 
+# ----- streaming -----
+#
+# A stream yields any number of TextDelta / ReasoningDelta events and then
+# exactly one terminal event: StreamCompleted, StreamIncomplete or
+# StreamFailed. Errors are events, never exceptions (KeyboardInterrupt
+# aside). Closing the iterator early releases the network connection.
+
+
+@dataclass(frozen=True)
+class TextDelta:
+    """A piece of the answer text."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class ReasoningDelta:
+    """A piece of the model's thinking; never part of the answer."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class StreamCompleted:
+    """The answer finished normally. `result.text` is the assembled answer."""
+
+    result: GenerationResult
+    metadata: Mapping[str, object] = field(default_factory=dict)  # e.g. durations, ids
+
+
+@dataclass(frozen=True)
+class StreamIncomplete:
+    """Generation stopped early (e.g. the token limit); `partial_text` is what arrived."""
+
+    reason: str
+    partial_text: str
+    usage: TokenUsage | None = None
+
+
+@dataclass(frozen=True)
+class StreamFailed:
+    """The request failed; `partial_text` is what arrived before the failure."""
+
+    error: ProviderError
+    partial_text: str = ""
+
+
+StreamEvent = TextDelta | ReasoningDelta | StreamCompleted | StreamIncomplete | StreamFailed
+TerminalEvent = StreamCompleted | StreamIncomplete | StreamFailed
+
+
 @dataclass(frozen=True)
 class Availability:
     available: bool
@@ -126,6 +177,10 @@ class Provider(Protocol):
 
     def default_model(self) -> str:
         """Model used when none is chosen. Raises ProviderError if none can be determined."""
+        ...
+
+    def stream(self, messages: Sequence[Message], options: GenerationOptions) -> Iterator[StreamEvent]:
+        """Like `generate`, but yields events as text arrives (see StreamEvent)."""
         ...
 
     def reasoning_support(self, model: str) -> ReasoningSupport:

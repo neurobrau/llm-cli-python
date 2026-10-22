@@ -1,9 +1,14 @@
 """The active provider, model and generation options for a chat."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
 from neurobrau_cli.conversation import Message
-from neurobrau_cli.providers.base import GenerationOptions, GenerationResult, Provider
+from neurobrau_cli.providers.base import (
+    GenerationOptions,
+    GenerationResult,
+    Provider,
+    StreamEvent,
+)
 from neurobrau_cli.settings import DEFAULT_ANSWER_STYLE, STYLE_INSTRUCTIONS
 
 
@@ -44,6 +49,10 @@ class ChatEngine:
 
     def reply(self, messages: Sequence[Message]) -> GenerationResult:
         return self.current.generate(messages, self.options())
+
+    def stream(self, messages: Sequence[Message]) -> Iterator[StreamEvent]:
+        """Same settings as `reply`, delivered as stream events."""
+        return self.current.stream(messages, self.options())
 
     def select(self, provider: str, model: str) -> None:
         """Switch model. Reasoning values are model-specific, so they reset here;

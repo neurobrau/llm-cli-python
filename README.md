@@ -25,7 +25,16 @@ neurobrau --model MODEL_ID --reasoning-effort low --max-output-tokens 200 --usag
 neurobrau --provider ollama --model qwen3.5:4b "Hello"
 neurobrau --provider ollama "Hello"     # first local model listed by Ollama
 neurobrau --answer-style brief "Explain recursion"
+neurobrau --provider ollama --stream "Explain neural networks."   # print text as it arrives
 ```
+
+`--stream` prints the answer while it is generated (one-shot and `--plain`
+chat; the fullscreen UI does not stream yet). With `--usage`, token counts
+(and, for Ollama, durations) go to stderr after a complete answer. A
+streamed answer that stops early, e.g. at the token limit, is reported on
+stderr and exits with code 8. In the plain chat, only completed answers are
+added to the conversation; a cut-off, failed or Ctrl+C-cancelled answer is
+shown but not saved or sent as context. Ollama thinking is never printed.
 
 Interactive chat (no prompt argument; model options still apply):
 
@@ -129,6 +138,7 @@ already in your scrollback). The transcript includes restored messages.
 | 5 | rate limit or quota exceeded |
 | 6 | timeout |
 | 7 | connection error |
+| 8 | streamed answer incomplete (`--stream`) |
 | 130 | chat interrupted with Ctrl+C |
 
 ## Limitations

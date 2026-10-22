@@ -6,9 +6,15 @@ from dataclasses import dataclass
 from typing import TextIO
 
 from neurobrau_cli import __version__
-from neurobrau_cli.formatting import format_usage
-from neurobrau_cli.providers.base import ProviderError
-from neurobrau_cli.session import ChatSession, ReplyFn, exchange
+from neurobrau_cli.formatting import format_stream_stats, format_usage
+from neurobrau_cli.providers.base import (
+    ProviderError,
+    ReasoningDelta,
+    StreamCompleted,
+    StreamIncomplete,
+    TextDelta,
+)
+from neurobrau_cli.session import ChatSession, ReplyFn, StreamFn, exchange
 from neurobrau_cli.storage import HistoryError
 
 __all__ = ["ChatSettings", "ReplyFn", "exchange", "parse_command", "run_chat"]
@@ -181,6 +187,67 @@ def send_message(
         print(f"warning: {save_warning}", file=stderr)
 
 
+class StreamPrinter:
+    """Prints answer deltas as they arrive, starting with the `AI > ` prefix."""
+
+    def __init__(self, stdout: TextIO) -> None:
+        self.stdout = stdout
+        self.started = False
+
+    def __call__(self, delta: TextDelta | ReasoningDelta) -> None:
+        if isinstance(delta, ReasoningDelta):
+            return  # thinking is never shown as the answer
+        self.start()
+        self.stdout.write(delta.text)
+        self.stdout.flush()
+
+    def start(self) -> None:
+        if not self.started:
+            self.started = True
+            self.stdout.write(AI_PREFIX)
+            self.stdout.flush()
+
+    def end_line(self) -> None:
+        if self.started:
+            print(file=self.stdout, flush=True)
+
+
+def stream_message(
+    text: str,
+    session: ChatSession,
+    stream_fn: StreamFn,
+    settings: ChatSettings,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> None:
+    """Send a user message and print the reply as it streams in."""
+    printer = StreamPrinter(stdout)
+    try:
+        terminal, save_warning = session.send_stream(text, stream_fn, printer)
+    except KeyboardInterrupt:
+        printer.end_line()
+        print("\nRequest cancelled. The partial response was not saved.", file=stderr)
+        return
+
+    if isinstance(terminal, StreamCompleted):
+        printer.start()  # an empty answer still gets its prefix
+        printer.end_line()
+        if settings.show_usage:
+            print(format_usage(terminal.result.usage), file=stderr)
+            stats = format_stream_stats(terminal.metadata)
+            if stats:
+                print(stats, file=stderr)
+        if save_warning:
+            print(f"warning: {save_warning}", file=stderr)
+        return
+    printer.end_line()
+    not_saved = " The partial response was not saved." if printer.started else ""
+    if isinstance(terminal, StreamIncomplete):
+        print(f"warning: Response incomplete: {terminal.reason}.{not_saved}", file=stderr)
+    else:
+        print(f"error: {terminal.error}{not_saved}", file=stderr)
+
+
 def run_chat(
     settings: ChatSettings,
     reply_fn: ReplyFn,
@@ -188,6 +255,7 @@ def run_chat(
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
     session: ChatSession | None = None,
+    stream_fn: StreamFn | None = None,
 ) -> int:
     """Run the read-send-print loop until the user exits. Return an exit code."""
     stdout = stdout or sys.stdout
@@ -218,7 +286,10 @@ def run_chat(
             if not handle_command(command, session, input_fn, stdout, stderr):
                 return EXIT_OK
             continue
-        send_message(text, session, reply_fn, settings, stdout, stderr)
+        if stream_fn is not None:
+            stream_message(text, session, stream_fn, settings, stdout, stderr)
+        else:
+            send_message(text, session, reply_fn, settings, stdout, stderr)
 
 
 def enable_line_editing() -> None:

@@ -7,7 +7,8 @@ items and tool calls) is not implemented yet.
 
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import closing
 from typing import Any
 
 import openai
@@ -22,6 +23,11 @@ from neurobrau_cli.providers.base import (
     ModelInfo,
     ProviderError,
     ReasoningSupport,
+    StreamCompleted,
+    StreamEvent,
+    StreamFailed,
+    StreamIncomplete,
+    TextDelta,
     TokenUsage,
 )
 
@@ -182,6 +188,102 @@ def send_request(request: dict[str, Any], client: OpenAI | None = None) -> Gener
     return GenerationResult(text=response.output_text, usage=extract_usage(response.usage))
 
 
+def stream_reply(
+    messages: Sequence[Message],
+    model: str = DEFAULT_MODEL,
+    reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
+    max_output_tokens: int | None = None,
+    client: OpenAI | None = None,
+    instructions: str | None = None,
+) -> Iterator[StreamEvent]:
+    """Stream a reply with the Responses API (`stream=True`, `store=False`).
+
+    Yields TextDelta for `response.output_text.delta` and one terminal event
+    for `response.completed`, `response.incomplete`, `response.failed` or
+    `error`. The SDK stream is closed when the generator finishes or is closed.
+    """
+    request = build_request(
+        to_input_items(messages), model, reasoning_effort, max_output_tokens, instructions
+    )
+    request["stream"] = True
+    try:
+        stream = (client or create_client()).responses.create(**request)
+    except OpenAIProviderError as error:  # missing API key
+        yield StreamFailed(error)
+        return
+    except openai.OpenAIError as error:
+        yield StreamFailed(translated(error))
+        return
+
+    parts: list[str] = []
+    try:
+        for event in stream:
+            terminal = handle_stream_event(event, parts)
+            if isinstance(terminal, TextDelta):
+                yield terminal
+            elif terminal is not None:
+                yield terminal
+                return
+        yield StreamFailed(
+            OpenAIProviderError("OpenAI stream ended before the response was complete."),
+            "".join(parts),
+        )
+    except openai.OpenAIError as error:
+        yield StreamFailed(translated(error), "".join(parts))
+    finally:
+        stream.close()
+
+
+def handle_stream_event(
+    event: Any, parts: list[str]
+) -> TextDelta | StreamCompleted | StreamIncomplete | StreamFailed | None:
+    """Map one SDK event. Returns a delta, a terminal event, or None to skip it."""
+    kind = getattr(event, "type", None)
+    if kind == "response.output_text.delta":
+        delta = getattr(event, "delta", None)
+        if not isinstance(delta, str):
+            return StreamFailed(
+                OpenAIProviderError("Invalid stream event from OpenAI: text delta is not a string."),
+                "".join(parts),
+            )
+        if not delta:
+            return None
+        parts.append(delta)
+        return TextDelta(delta)
+    if kind == "response.completed":
+        response = event.response
+        text = "".join(parts) or (getattr(response, "output_text", "") or "")
+        metadata = {"response_id": getattr(response, "id", None), "model": getattr(response, "model", None)}
+        return StreamCompleted(
+            GenerationResult(text=text, usage=extract_usage(getattr(response, "usage", None))),
+            {key: value for key, value in metadata.items() if value is not None},
+        )
+    if kind == "response.incomplete":
+        response = event.response
+        details = getattr(response, "incomplete_details", None)
+        reason = getattr(details, "reason", None) or "unknown reason"
+        readable = {"max_output_tokens": "the max output token limit was reached",
+                    "content_filter": "the content filter stopped the response"}
+        return StreamIncomplete(
+            readable.get(reason, reason), "".join(parts), extract_usage(getattr(response, "usage", None))
+        )
+    if kind == "response.failed":
+        error = getattr(event.response, "error", None)
+        message = getattr(error, "message", None) or "no details"
+        return StreamFailed(OpenAIProviderError(f"OpenAI response failed: {message}"), "".join(parts))
+    if kind == "error":
+        message = getattr(event, "message", None) or "no details"
+        return StreamFailed(OpenAIProviderError(f"OpenAI stream error: {message}"), "".join(parts))
+    return None  # other event types (reasoning, output items, ...) are not needed
+
+
+def translated(error: openai.OpenAIError) -> OpenAIProviderError:
+    """translate_error, keeping the SDK error as the cause (as `raise ... from` would)."""
+    result = translate_error(error)
+    result.__cause__ = error
+    return result
+
+
 def extract_usage(usage: Any) -> TokenUsage | None:
     """Convert the SDK usage object into TokenUsage, if usage was reported."""
     if usage is None:
@@ -281,6 +383,60 @@ class OpenAIProvider:
             max_output_tokens=options.max_output_tokens,
             client=self.client(),
             **kwargs,
+        )
+
+    def stream(self, messages: Sequence[Message], options: GenerationOptions) -> Iterator[StreamEvent]:
+        """Stream a reply. Rejected reasoning values follow the same rules as `generate`."""
+        effort = options.reasoning_effort
+        if effort is not None and not options.reasoning_explicit and options.model in self._no_reasoning:
+            effort = None
+        try:
+            client = self.client()
+        except OpenAIProviderError as error:
+            yield StreamFailed(error)
+            return
+        with closing(self._stream(messages, options, effort, client)) as events:
+            yield from self._with_reasoning_fallback(events, messages, options, effort, client)
+
+    def _with_reasoning_fallback(
+        self,
+        events: Iterator[StreamEvent],
+        messages: Sequence[Message],
+        options: GenerationOptions,
+        effort: str | None,
+        client: OpenAI,
+    ) -> Iterator[StreamEvent]:
+        for event in events:
+            rejected = (
+                isinstance(event, StreamFailed)
+                and effort is not None
+                and not event.partial_text
+                and rejects_reasoning(event.error)
+            )
+            if not rejected:
+                yield event
+                continue
+            assert isinstance(event, StreamFailed)
+            if options.reasoning_explicit:
+                yield StreamFailed(OpenAIProviderError(
+                    f"{options.model} does not accept reasoning effort '{effort}' "
+                    f"({event.error}). Choose another value with F4 or --reasoning-effort."
+                ))
+                return
+            self._no_reasoning.add(options.model)
+            yield from self._stream(messages, options, None, client)
+            return
+
+    def _stream(
+        self, messages: Sequence[Message], options: GenerationOptions, effort: str | None, client: OpenAI
+    ) -> Iterator[StreamEvent]:
+        return stream_reply(
+            list(messages),
+            model=options.model,
+            reasoning_effort=effort,
+            max_output_tokens=options.max_output_tokens,
+            client=client,
+            instructions=options.instructions,
         )
 
     def reasoning_support(self, model: str) -> ReasoningSupport:
