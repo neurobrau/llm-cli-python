@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neurobrau-llm-cli"
-version = "0.1.0"
+dynamic = ["version"]  # single source: neurobrau_cli.__version__
 description = "Multi-provider LLM command-line client"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -22,3 +22,6 @@ neurobrau = "neurobrau_cli.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "neurobrau_cli.__version__"}

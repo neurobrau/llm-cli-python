@@ -21,6 +21,7 @@ SCHEMA_VERSION = 1
 APP_DIR_NAME = "neurobrau"
 CONVERSATIONS_DIR_NAME = "conversations"
 ROLES = ("user", "assistant")
+ACTIVE_FILE_NAME = "active.json"
 DIR_MODE = 0o700
 
 
@@ -230,6 +231,39 @@ class HistoryStore:
             write_atomically(path, content)
         except OSError as error:
             raise HistoryError(describe_os_error("save", path, error)) from error
+
+    # ----- active selection -----
+
+    @property
+    def active_path(self) -> Path:
+        """`active.json` next to the conversations directory (outside /cleanup's reach)."""
+        return self.directory.parent / ACTIVE_FILE_NAME
+
+    def load_active(self) -> tuple[tuple[str, str] | None, str | None]:
+        """The provider/model in use when the app last ran, and a warning if unreadable."""
+        try:
+            data = json.loads(self.active_path.read_bytes().decode("utf-8"))
+        except FileNotFoundError:
+            return None, None
+        except (OSError, ValueError) as error:
+            return None, f"Ignoring unreadable {self.active_path}: {error}."
+        if not isinstance(data, dict):
+            return None, f"Ignoring invalid {self.active_path}."
+        provider, model = data.get("provider"), data.get("model")
+        if data.get("schema_version") != SCHEMA_VERSION or not (
+            isinstance(provider, str) and provider and isinstance(model, str) and model
+        ):
+            return None, f"Ignoring invalid {self.active_path}."
+        return (provider, model), None
+
+    def save_active(self, provider: str, model: str) -> None:
+        """Record the active selection. Conversation files are not touched."""
+        data = {"schema_version": SCHEMA_VERSION, "provider": provider, "model": model}
+        try:
+            self.ensure_directory()
+            write_atomically(self.active_path, json.dumps(data, ensure_ascii=False) + "\n")
+        except OSError as error:
+            raise HistoryError(describe_os_error("save", self.active_path, error)) from error
 
     def delete_all(self) -> int:
         """Delete every conversation file. Return how many were deleted."""

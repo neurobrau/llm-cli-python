@@ -378,3 +378,126 @@ def test_transport_ignores_proxies_for_local_server(
     Handler.routes = {"/api/tags": (200, b'{"models": []}', 0)}
 
     assert ollama_provider.urllib_transport("GET", f"{server}/api/tags", None, 2) == {"models": []}
+
+
+# ----- Task 007: thinking metadata, limits, answer style -----
+
+ON_OFF_SHOW = {"capabilities": ["completion", "thinking"],
+               "thinking": {"values": [False, True], "default": True}}
+LEVEL_SHOW = {"capabilities": ["completion", "thinking"],
+              "thinking": {"values": ["low", "medium", "high"], "default": "medium"}}
+GPT_OSS_TAG = {"name": "gpt-oss:20b", "capabilities": ["completion", "thinking"],
+               "details": {"context_length": 131072}}
+
+
+def provider_with_show(show: dict, models: list[dict] | None = None) -> tuple[OllamaProvider, FakeOllama]:
+    fake = FakeOllama(models=models)
+    original = fake.__call__
+
+    def transport(method: str, url: str, payload: dict | None, timeout: float) -> object:
+        if url.endswith("/api/show"):
+            fake.requests.append((method, "/api/show", payload, timeout))
+            return show
+        return original(method, url, payload, timeout)
+
+    return OllamaProvider(base_url="http://127.0.0.1:11434", transport=transport), fake
+
+
+def test_on_off_thinking_from_show_metadata() -> None:
+    provider, fake = provider_with_show(ON_OFF_SHOW)
+
+    support = provider.reasoning_support("qwen3.5:4b")
+    provider.reasoning_support("qwen3.5:4b")
+
+    assert support == ollama_provider.ReasoningSupport(("off", "on"), True, "off", False)
+    assert fake.paths.count("/api/show") == 1  # cached
+
+
+def test_named_thinking_levels() -> None:
+    provider, fake = provider_with_show(LEVEL_SHOW, models=[GPT_OSS_TAG])
+
+    support = provider.reasoning_support("gpt-oss:20b")
+    chat_result = provider.generate(
+        [Message("user", "Hi")], GenerationOptions("gpt-oss:20b", "high", reasoning_explicit=True)
+    )
+
+    assert support.values == ("low", "medium", "high")
+    assert (support.default, support.allows_default) == (None, True)
+    assert fake.chat_payloads[0]["think"] == "high"
+    assert chat_result.text == "local reply 1"
+
+
+def test_unsupported_level_is_an_error_when_explicit() -> None:
+    provider, fake = provider_with_show(LEVEL_SHOW, models=[GPT_OSS_TAG])
+
+    with pytest.raises(OllamaProviderError, match="does not support thinking level 'xhigh'"):
+        provider.generate([Message("user", "Hi")],
+                          GenerationOptions("gpt-oss:20b", "xhigh", reasoning_explicit=True))
+
+    assert fake.chat_payloads == []
+
+
+def test_thinking_capability_without_metadata_gives_on_off() -> None:
+    provider, _ = provider_with_show({"capabilities": ["completion", "thinking"]})
+
+    assert provider.reasoning_support("qwen3.5:4b").values == ("off", "on")
+
+
+def test_model_without_thinking_has_no_reasoning() -> None:
+    tag = {**QWEN_TAG, "capabilities": ["completion"]}
+    provider, _ = provider_with_show({"capabilities": ["completion"]}, models=[tag])
+
+    support = provider.reasoning_support("qwen3.5:4b")
+
+    assert (support.known, support.values) == (True, ())
+
+
+def test_explicit_thinking_on_model_without_thinking_is_an_error() -> None:
+    tag = {**QWEN_TAG, "capabilities": ["completion"]}
+    fake = FakeOllama(models=[tag])
+
+    with pytest.raises(OllamaProviderError, match="does not support thinking"):
+        make_provider(fake).generate(
+            [Message("user", "Hi")], GenerationOptions("qwen3.5:4b", "on", reasoning_explicit=True)
+        )
+    assert fake.chat_payloads == []
+
+
+def test_on_maps_to_think_true() -> None:
+    fake = FakeOllama()
+
+    chat(make_provider(fake), "Hi", reasoning_effort="on", reasoning_explicit=True)
+
+    assert fake.chat_payloads[0]["think"] is True
+    assert "/api/show" not in fake.paths  # off/on need no metadata request
+
+
+def test_reasoning_support_never_queries_cloud_models() -> None:
+    fake = FakeOllama()
+
+    with pytest.raises(OllamaProviderError, match="cloud model"):
+        make_provider(fake).reasoning_support("glm-4.7:cloud")
+
+    assert "/api/show" not in fake.paths
+
+
+def test_max_output_limit_is_context_length_from_tags() -> None:
+    fake = FakeOllama(models=[GPT_OSS_TAG, QWEN_TAG])
+    provider = make_provider(fake)
+
+    assert provider.max_output_limit("gpt-oss:20b") == 131072
+    assert provider.max_output_limit("qwen3.5:4b") is None
+    assert fake.paths == ["/api/tags"]
+
+
+def test_answer_style_is_a_system_message_for_this_request_only() -> None:
+    fake = FakeOllama()
+
+    chat(make_provider(fake), "Hi", "Hello!", "More?", instructions="Be brief.")
+
+    assert fake.chat_payloads[0]["messages"] == [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hello!"},
+        {"role": "user", "content": "More?"},
+    ]

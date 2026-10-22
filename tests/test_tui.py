@@ -6,17 +6,21 @@ from pathlib import Path
 
 import pytest
 
+from neurobrau_cli import __version__
+
 from neurobrau_cli.chat import EXIT_INTERRUPTED, ChatSettings
 from neurobrau_cli.conversation import Message
 from neurobrau_cli.engine import ChatEngine
-from neurobrau_cli.providers.base import Availability, ModelInfo, ProviderError
+from neurobrau_cli.providers.base import Availability, ModelInfo, ProviderError, ReasoningSupport
 from neurobrau_cli.providers.openai_provider import (
     ErrorKind,
     GenerationResult,
     OpenAIProviderError,
     TokenUsage,
 )
+from neurobrau_cli.preferences import Preferences
 from neurobrau_cli.session import ChatSession
+from neurobrau_cli.settings import SettingsStore
 from neurobrau_cli.storage import HistoryStore
 from neurobrau_cli.ui import tui
 from neurobrau_cli.ui.tui import Entry, Styles, TuiApp
@@ -73,7 +77,7 @@ def test_initial_screen_shows_regions_and_status() -> None:
 
     lines = screen.lines()
     assert len(lines) == 25 and all(len(line) == 80 for line in lines)
-    assert lines[0].startswith("+-[ NeuroBräu CLI 0.1.0 ]")
+    assert lines[0].startswith(f"+-[ NeuroBräu CLI {__version__} ]")
     assert "[ Status ]" in lines[19]
     assert "Provider: openai  Model: gpt-test  Tokens: -" in lines[20]
     assert "[READY]" in lines[20]
@@ -595,9 +599,14 @@ class FakeProvider:
         self.on_list = on_list
         self.calls: list[list[Message]] = []
         self.list_calls = 0
+        self.support = ReasoningSupport(known=False)
+        self.support_calls = 0
+        self.limit: int | None = None
+        self.options: list[object] = []
 
     def generate(self, messages: Sequence[Message], options: object) -> GenerationResult:
         self.calls.append(list(messages))
+        self.options.append(options)
         return GenerationResult(f"{self.label} says hi", TokenUsage(1, 2, 3))
 
     def list_models(self, refresh: bool = False) -> list[ModelInfo]:
@@ -613,6 +622,13 @@ class FakeProvider:
 
     def default_model(self) -> str:
         return self.models[0]
+
+    def reasoning_support(self, model: str) -> ReasoningSupport:
+        self.support_calls += 1
+        return self.support
+
+    def max_output_limit(self, model: str) -> int | None:
+        return self.limit
 
 
 def make_engine_app(
@@ -637,7 +653,7 @@ def make_engine_app(
 
 def menu_frame(screen: FakeScreen) -> list[str]:
     """The last drawn frame that showed a menu."""
-    return next(frame for frame in reversed(screen.snapshots) if "+-[ SELECT" in "".join(frame))
+    return next(frame for frame in reversed(screen.snapshots) if "Enter=OK Esc=cancel" in "".join(frame))
 
 
 def panel_text(screen: FakeScreen) -> list[str]:
@@ -851,15 +867,6 @@ def test_ctrl_c_during_discovery_cancels() -> None:
     assert engine.provider == "openai"
 
 
-@pytest.mark.parametrize("key", [curses.KEY_F4, curses.KEY_F5, curses.KEY_F6])
-def test_display_only_keys_explain_themselves(key: int) -> None:
-    app, screen, engine = make_engine_app([key])
-
-    app.run()
-
-    assert "display-only" in screen.text()
-
-
 @pytest.mark.parametrize("key", [curses.KEY_F2, curses.KEY_F3])
 def test_menus_without_engine_are_unavailable(key: int) -> None:
     app, screen, _ = make_app([key])
@@ -868,3 +875,310 @@ def test_menus_without_engine_are_unavailable(key: int) -> None:
 
     assert "not available" in screen.text()
     assert app.state.menu is None
+
+
+# ----- Task 007: F4 reasoning, F5 max tokens, F6 answer style -----
+
+ON_OFF = ReasoningSupport(("off", "on"), known=True, default="off", allows_default=False)
+
+
+def make_settings_app(
+    keys: Iterable[str | int] = (),
+    support: ReasoningSupport = ON_OFF,
+    limit: int | None = None,
+    store: SettingsStore | None = None,
+    rows: int = 25,
+    cols: int = 80,
+) -> tuple[TuiApp, FakeScreen, ChatEngine, FakeProvider]:
+    provider = FakeProvider("ollama", "Ollama", ["qwen3.5:4b", "llama3.2:3b"])
+    provider.support, provider.limit = support, limit
+    engine = ChatEngine({"ollama": provider}, "ollama", "qwen3.5:4b")
+    preferences = Preferences(store)
+    preferences.apply(engine)
+    settings = ChatSettings("ollama", "qwen3.5:4b")
+    screen = FakeScreen(rows, cols, keys)
+    app = TuiApp(screen, settings, engine.reply, STYLES, ChatSession(), engine, preferences)
+    app.sync_settings()
+    provider.support_calls = 0
+    return app, screen, engine, provider
+
+
+def test_f4_offers_on_off_and_applies_without_clearing_history() -> None:
+    keys = [*keys_for("First"), curses.KEY_F4, curses.KEY_DOWN, "\n", *keys_for("Second")]
+    app, screen, engine, provider = make_settings_app(keys)
+
+    app.run()
+
+    menu = "\n".join(menu_frame(screen))
+    assert "[ REASONING ]" in menu and "* Off" in menu and "  On" in menu
+    assert "Default" not in menu
+    assert provider.options[0].reasoning_effort == "off"
+    assert (provider.options[1].reasoning_effort, provider.options[1].reasoning_explicit) == ("on", True)
+    assert provider.calls[1] == [  # history kept and sent
+        Message("user", "First"), Message("assistant", "Ollama says hi"), Message("user", "Second")
+    ]
+    assert " on" in panel_text(screen)
+    assert "YOU > First" in screen.text()
+
+
+def test_f4_with_unknown_support_offers_only_default() -> None:
+    app, screen, _, _ = make_settings_app([curses.KEY_F4], support=ReasoningSupport(known=False))
+
+    app.run()
+
+    menu = "\n".join(menu_frame(screen))
+    assert "Default (support unknown)" in menu
+    assert "1/1" in menu
+    assert any("not confirmed" in entry.text for entry in app.state.entries)
+
+
+def test_f4_for_model_without_reasoning() -> None:
+    app, screen, _, _ = make_settings_app([curses.KEY_F4], support=ReasoningSupport(known=True))
+
+    app.run()
+
+    assert app.state.entries[-1] == Entry("info", "qwen3.5:4b does not support reasoning.")
+    assert not any("[ REASONING ]" in "".join(frame) for frame in screen.snapshots)
+
+
+def test_f4_default_choice_for_effort_models() -> None:
+    efforts = ReasoningSupport(("low", "high"), known=True)
+    app, screen, engine, provider = make_settings_app(
+        [curses.KEY_F4, curses.KEY_END, "\n", curses.KEY_F4, curses.KEY_HOME, "\n"], support=efforts
+    )
+
+    app.run()
+
+    menu = "\n".join(menu_frame(screen))
+    assert "Default" in menu and "Low" in menu and "High" in menu
+    assert (engine.reasoning_effort, engine.reasoning_explicit) == (None, False)
+    assert " default" in panel_text(screen)
+
+
+def test_f5_presets_custom_and_limits() -> None:
+    app, screen, engine, _ = make_settings_app([curses.KEY_F5], limit=1024)
+
+    app.run()
+
+    menu = "\n".join(menu_frame(screen))
+    assert all(f"  {n}" in menu for n in ("256", "512", "1024"))
+    assert "2048" not in menu and "4096" not in menu
+    assert any("Custom..." in line and "up to 1024" in line for line in menu.splitlines())
+    assert "* Default" in menu
+
+
+def test_f5_preset_applies_to_next_request() -> None:
+    keys = [*keys_for("One"), curses.KEY_F5, curses.KEY_DOWN, curses.KEY_DOWN, curses.KEY_DOWN,
+            "\n", *keys_for("Two")]
+    app, screen, engine, provider = make_settings_app(keys)
+
+    app.run()
+
+    assert engine.max_output_tokens == 1024
+    assert [options.max_output_tokens for options in provider.options] == [None, 1024]
+    assert len(app.session.messages) == 4
+    assert " 1024" in panel_text(screen)
+
+
+def custom_tokens_keys(*typed: str) -> list[str | int]:
+    keys: list[str | int] = [curses.KEY_F5, curses.KEY_END, "\n"]
+    for text in typed:
+        keys += [*text, "\n"]
+    return keys
+
+
+def test_f5_custom_value() -> None:
+    app, screen, engine, _ = make_settings_app(custom_tokens_keys("3000"), limit=8192)
+
+    app.run()
+
+    assert engine.max_output_tokens == 3000
+    prompt_frame = next(f for f in screen.snapshots if any("| TOKENS >" in line for line in f))
+    assert any("[ENTER TOKEN LIMIT]" in line for line in prompt_frame)
+    assert app.state.entering_tokens is False
+    assert " 3000" in panel_text(screen)
+
+
+@pytest.mark.parametrize(
+    ("typed", "message"),
+    [
+        ("abc", "'abc' is not a positive whole number"),
+        ("0", "must be a positive whole number"),
+        ("-5", "'-5' is not a positive whole number"),
+        ("9000", "9000 exceeds the limit of 8192 output tokens for qwen3.5:4b"),
+        ("", "'' is not a positive whole number"),
+    ],
+)
+def test_f5_custom_rejects_invalid_values_and_keeps_prompt(typed: str, message: str) -> None:
+    app, screen, engine, _ = make_settings_app(custom_tokens_keys(typed), limit=8192)
+
+    app.run()
+
+    assert engine.max_output_tokens is None
+    assert app.state.entering_tokens  # still asking
+    assert message in app.state.entries[-1].text
+    assert app.state.entries[-1].kind == "error"
+
+
+def test_f5_custom_retry_after_invalid_value() -> None:
+    app, _, engine, _ = make_settings_app(custom_tokens_keys("lots", "700"))
+
+    app.run()
+
+    assert engine.max_output_tokens == 700
+
+
+def test_f5_custom_escape_restores_draft() -> None:
+    keys = [*"draft", *custom_tokens_keys()[:3], "1", "2", "\x1b", "<CTRL-C>"]
+    app, _, engine, provider = make_settings_app(keys)
+
+    assert app.run() == EXIT_INTERRUPTED  # Ctrl+D would not exit: the draft is back
+
+    assert (app.state.input_text, app.state.cursor) == ("draft", 5)
+    assert engine.max_output_tokens is None
+    assert provider.calls == []  # nothing was sent while typing the number
+
+
+def test_f6_answer_style_sets_instructions_but_not_history() -> None:
+    keys = [*keys_for("One"), curses.KEY_F6, curses.KEY_END, "\n", *keys_for("Two")]
+    app, screen, engine, provider = make_settings_app(keys)
+
+    app.run()
+
+    menu = "\n".join(menu_frame(screen))
+    assert "Brief" in menu and "* Normal" in menu and "Detailed" in menu
+    assert provider.options[0].instructions is None
+    assert "example" in provider.options[1].instructions
+    assert all(m.role in ("user", "assistant") for m in provider.calls[1])  # no style messages
+    assert len(app.session.messages) == 4
+    assert " detailed" in panel_text(screen)
+    assert engine.reasoning_effort == "off"  # style does not touch reasoning or tokens
+    assert engine.max_output_tokens is None
+
+
+def test_menu_navigation_makes_no_requests() -> None:
+    keys = [curses.KEY_F4, curses.KEY_DOWN, curses.KEY_UP, curses.KEY_DOWN, "\x1b",
+            curses.KEY_F5, curses.KEY_NPAGE, curses.KEY_PPAGE, curses.KEY_END, "\x1b",
+            curses.KEY_F6, curses.KEY_DOWN, curses.KEY_DOWN, "\x1b"]
+    app, _, engine, provider = make_settings_app(keys)
+
+    app.run()
+
+    assert provider.support_calls == 1  # opening F4 once
+    assert provider.list_calls == 0
+    assert provider.calls == []
+    assert (engine.reasoning_effort, engine.max_output_tokens, engine.answer_style) == (
+        "off", None, "normal"
+    )
+
+
+def test_settings_changes_are_saved_and_restored(tmp_path: Path) -> None:
+    store = SettingsStore(tmp_path / "neurobrau" / "settings.json")
+    keys = [curses.KEY_F4, curses.KEY_DOWN, "\n", curses.KEY_F5, curses.KEY_DOWN, "\n",
+            curses.KEY_F6, curses.KEY_HOME, "\n"]
+    make_settings_app(keys, store=store)[0].run()
+
+    settings, warnings = SettingsStore(store.path).load()
+    app, screen, engine, _ = make_settings_app(store=store)
+    app.preferences.settings = settings
+    app.preferences.apply(engine)
+
+    assert warnings == []
+    assert (engine.reasoning_effort, engine.max_output_tokens, engine.answer_style) == (
+        "on", 256, "brief"
+    )
+
+
+def test_switching_model_applies_its_own_saved_settings() -> None:
+    keys = [curses.KEY_F5, curses.KEY_DOWN, "\n", curses.KEY_F2, curses.KEY_DOWN, "\n",
+            curses.KEY_F2, curses.KEY_HOME, "\n"]
+    app, screen, engine, _ = make_settings_app(keys)
+
+    app.run()
+
+    # 256 was chosen for qwen3.5:4b; llama3.2:3b had none; back on qwen it is restored.
+    assert app.preferences.settings.for_model("ollama", "qwen3.5:4b").max_output_tokens == 256
+    assert app.preferences.settings.for_model("ollama", "llama3.2:3b").max_output_tokens is None
+    assert (engine.model, engine.max_output_tokens) == ("qwen3.5:4b", 256)
+
+
+def test_switching_to_model_without_saved_choice_support_explains_fallback() -> None:
+    app, _, engine, provider = make_settings_app([curses.KEY_F4, curses.KEY_DOWN, "\n"])
+    app.run()
+    provider.support = ReasoningSupport(known=True)  # pretend llama has no thinking
+    app.preferences.settings = app.preferences.settings.with_model(
+        "ollama", "llama3.2:3b", reasoning="on"
+    )
+
+    app.select_model("llama3.2:3b")
+
+    assert engine.reasoning_effort is None
+    assert any("Saved reasoning 'On' is not available for llama3.2:3b" in entry.text
+               for entry in app.state.entries)
+
+
+@pytest.mark.parametrize("key", [curses.KEY_F4, curses.KEY_F5, curses.KEY_F6])
+def test_settings_menus_fit_small_terminals(key: int) -> None:
+    app, screen, _, _ = make_settings_app([key], rows=12, cols=40)
+
+    app.run()  # FakeScreen fails on any out-of-bounds drawing
+
+    assert any("Enter=OK" in "".join(frame) for frame in screen.snapshots)
+
+
+@pytest.mark.parametrize("key", [curses.KEY_F4, curses.KEY_F5, curses.KEY_F6])
+def test_settings_menus_without_engine_are_unavailable(key: int) -> None:
+    app, screen, _ = make_app([key])
+
+    app.run()
+
+    assert "not available" in screen.text()
+
+
+# ----- Task 007b: switching back restores the conversation -----
+
+
+def test_f3_switch_back_restores_conversation(store: HistoryStore) -> None:
+    keys = [*keys_for("OpenAI question"),
+            curses.KEY_F3, curses.KEY_DOWN, "\n", *keys_for("Ollama question"),
+            curses.KEY_F3, curses.KEY_UP, "\n", *keys_for("OpenAI follow-up")]
+    app, screen, engine = make_engine_app(keys, store=store)
+
+    app.run()
+
+    openai, ollama = engine.providers["openai"], engine.providers["ollama"]
+    assert ollama.calls == [[Message("user", "Ollama question")]]
+    assert openai.calls[1] == [
+        Message("user", "OpenAI question"),
+        Message("assistant", "OpenAI says hi"),
+        Message("user", "OpenAI follow-up"),
+    ]
+    restored_frame = next(f for f in screen.snapshots if "Restored its conversation" in "".join(f))
+    text = "\n".join(restored_frame)
+    assert "YOU > OpenAI question" in text and "Ollama question" not in text
+    assert any(e.text == "Now using OpenAI / gpt-a. Restored its conversation (2 messages)."
+               for e in app.state.entries)
+
+
+def test_f2_switch_between_models_restores_each(store: HistoryStore) -> None:
+    keys = [*keys_for("About A"), curses.KEY_F2, curses.KEY_DOWN, "\n", *keys_for("About B"),
+            curses.KEY_F2, curses.KEY_UP, "\n"]
+    app, screen, engine = make_engine_app(keys, store=store)
+
+    app.run()
+
+    assert engine.model == "gpt-a"
+    assert [m.content for m in app.session.messages] == ["About A", "OpenAI says hi"]
+    assert "About B" not in screen.text()
+
+
+def test_reset_then_switching_back_shows_empty_conversation(store: HistoryStore) -> None:
+    keys = [*keys_for("Old"), *keys_for("/reset"), curses.KEY_F3, curses.KEY_DOWN, "\n",
+            curses.KEY_F3, curses.KEY_UP, "\n"]
+    app, screen, engine = make_engine_app(keys, store=store)
+
+    app.run()
+
+    assert app.session.messages == ()
+    assert "Old" not in screen.text()
+    assert any(ChatSession(store, store.load(p)).messages for p in store.list_paths())  # archived

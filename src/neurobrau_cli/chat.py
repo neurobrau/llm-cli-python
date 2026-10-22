@@ -41,6 +41,7 @@ class ChatSettings:
     show_usage: bool = False
     reasoning_effort: str | None = None
     max_output_tokens: int | None = None
+    answer_style: str | None = None
 
 
 def parse_command(text: str) -> str | None:

@@ -28,10 +28,12 @@ from neurobrau_cli.chat import (
     restored_notice,
 )
 from neurobrau_cli.engine import ChatEngine
+from neurobrau_cli.preferences import Preferences, check_max_tokens, label
 from neurobrau_cli.providers import provider_label
 from neurobrau_cli.providers.base import ProviderError, TokenUsage
 from neurobrau_cli.session import ChatSession
-from neurobrau_cli.ui.menu import Menu, MenuItem
+from neurobrau_cli.settings import ANSWER_STYLES, TOKEN_PRESETS
+from neurobrau_cli.ui.menu import ESCAPE, Menu, MenuItem
 
 T = TypeVar("T")
 
@@ -44,7 +46,13 @@ MENU_MIN_WIDTH = 30
 
 USER_LABEL = "YOU > "
 AI_LABEL = "AI > "
-HELP_LINE = " /help /reset /exit | F2 model F3 provider | PgUp/PgDn scroll | Ctrl+C quit"
+HELP_LINE = " /help /reset /exit | F2-F6 settings | PgUp/PgDn scroll | Ctrl+C quit"
+TOKENS_LABEL = "TOKENS > "
+STYLE_NOTES = {
+    "brief": "short, concise answers",
+    "normal": "standard answers",
+    "detailed": "thorough, with examples",
+}
 HELP_TEXT = """Commands:
   /help     show this help
   /reset    start a new conversation (the previous one stays saved)
@@ -53,13 +61,10 @@ HELP_TEXT = """Commands:
 Backslash aliases also work: \\help, \\reset, \\cleanup, \\exit.
 Keys: Enter send, Backspace/Delete edit, Left/Right/Home/End move,
 Ctrl+U clear input, PgUp/PgDn/Up/Down scroll, Ctrl+D (empty input) or Ctrl+C quit.
-F2 choose model, F3 choose provider (both start a new conversation).
-F4 reasoning, F5 max tokens, F6 answer style are display-only for now."""
-DISPLAY_ONLY_KEYS = {
-    curses.KEY_F4: "F4 REASONING is display-only for now; set it with --reasoning-effort.",
-    curses.KEY_F5: "F5 MAX TOKENS is display-only for now; set it with --max-output-tokens.",
-    curses.KEY_F6: "F6 ANSWER STYLE is display-only for now.",
-}
+F2 model, F3 provider (both start a new conversation).
+F4 reasoning, F5 max output tokens, F6 answer style (keep the conversation;
+they apply from the next message and are saved per model).
+In menus: Up/Down move, Enter selects, Esc cancels."""
 
 CTRL_A = "\x01"
 CTRL_D = "\x04"
@@ -246,6 +251,9 @@ class TuiState:
     confirming_cleanup: bool = False  # next submitted line answers the cleanup prompt
     busy: str | None = None  # e.g. "LOADING MODELS" while a blocking discovery call runs
     menu: Menu | None = None
+    entering_tokens: bool = False  # the input line asks for a custom max-tokens value
+    token_limit: int | None = None
+    saved_input: tuple[str, int] = ("", 0)  # draft restored after the token prompt
 
 
 class TuiApp:
@@ -259,13 +267,15 @@ class TuiApp:
         styles: Styles = Styles(),
         session: ChatSession | None = None,
         engine: ChatEngine | None = None,
+        preferences: Preferences | None = None,
     ) -> None:
         self.screen = screen
         self.settings = settings
         self.reply_fn = reply_fn
         self.styles = styles
         self.session = session or ChatSession()
-        self.engine = engine  # None: provider/model menus are unavailable
+        self.engine = engine  # None: provider/model/settings menus are unavailable
+        self.preferences = preferences or Preferences()
         self.state = TuiState()
         self.exit_code: int | None = None
         self.show_restored_session()
@@ -300,12 +310,11 @@ class TuiApp:
         state = self.state
         if state.menu is not None:
             self.handle_menu_key(key)
-        elif key == curses.KEY_F2:
-            self.open_model_menu()
-        elif key == curses.KEY_F3:
-            self.open_provider_menu()
-        elif key in DISPLAY_ONLY_KEYS:
-            self.add_entry("info", DISPLAY_ONLY_KEYS[key])
+        elif state.entering_tokens and key == ESCAPE:
+            self.end_token_prompt()
+            self.add_entry("info", "Max output tokens unchanged.")
+        elif key in self.function_keys() and not state.entering_tokens:
+            self.function_keys()[key]()
             state.scroll = 0
         elif key in ENTER_KEYS:
             self.submit()
@@ -349,10 +358,22 @@ class TuiApp:
 
     # ----- actions -----
 
+    def function_keys(self) -> dict[Key, Callable[[], None]]:
+        return {
+            curses.KEY_F2: self.open_model_menu,
+            curses.KEY_F3: self.open_provider_menu,
+            curses.KEY_F4: self.open_reasoning_menu,
+            curses.KEY_F5: self.open_tokens_menu,
+            curses.KEY_F6: self.open_style_menu,
+        }
+
     def submit(self) -> None:
         """Handle the current input line as a command or a message."""
         text = self.state.input_text.strip()
         self.state.input_text, self.state.cursor = "", 0
+        if self.state.entering_tokens:
+            self.submit_custom_tokens(text)
+            return
         if not text:
             return
 
@@ -452,6 +473,138 @@ class TuiApp:
         ]
         self.state.menu = Menu.create("model", f"SELECT {provider.label.upper()} MODEL", items)
 
+    # ----- F4/F5/F6 settings (never touch the conversation) -----
+
+    def open_reasoning_menu(self) -> None:
+        if self.engine is None:
+            self.add_entry("error", "Reasoning settings are not available.")
+            return
+        engine = self.engine
+        support = self.run_busy(
+            "CHECKING REASONING", lambda: engine.current.reasoning_support(engine.model)
+        )
+        if support is None:
+            return
+        if not support.known:
+            items = [MenuItem("Default (support unknown)", "", current=True)]
+            self.add_entry(
+                "info",
+                f"Reasoning support for {engine.model} is not confirmed, so only the "
+                "model's default is offered. --reasoning-effort sends a value explicitly.",
+            )
+        elif not support.values:
+            self.add_entry("info", f"{engine.model} does not support reasoning.")
+            return
+        else:
+            items = [MenuItem("Default", "", "model default")] if support.allows_default else []
+            items += [MenuItem(label(value), value) for value in support.values]
+            current = engine.reasoning_effort or ""
+            items = [replace(item, current=item.value == current) for item in items]
+        self.state.menu = Menu.create("reasoning", "REASONING", items)
+
+    def open_tokens_menu(self) -> None:
+        if self.engine is None:
+            self.add_entry("error", "Max output token settings are not available.")
+            return
+        engine = self.engine
+        # Wrapped in a tuple: None means the check failed, (None,) means no known limit.
+        checked = self.run_busy(
+            "CHECKING MODEL LIMITS", lambda: (engine.current.max_output_limit(engine.model),)
+        )
+        if checked is None:
+            return
+        limit = checked[0]
+        current = engine.max_output_tokens
+        presets = [value for value in TOKEN_PRESETS if limit is None or value <= limit]
+        items = [MenuItem("Default", "", "model default", current=current is None)]
+        items += [MenuItem(str(value), str(value), current=value == current) for value in presets]
+        custom_note = f"up to {limit}" if limit else "any positive number"
+        is_custom = current is not None and current not in presets
+        custom_label = f"Custom ({current})" if is_custom else "Custom..."
+        items.append(MenuItem(custom_label, "custom", custom_note, current=is_custom))
+        self.state.token_limit = limit
+        self.state.menu = Menu.create("max_tokens", "MAX OUTPUT TOKENS", items)
+
+    def open_style_menu(self) -> None:
+        if self.engine is None:
+            self.add_entry("error", "Answer style settings are not available.")
+            return
+        items = [
+            MenuItem(style.capitalize(), style, STYLE_NOTES[style],
+                     current=style == self.engine.answer_style)
+            for style in ANSWER_STYLES
+        ]
+        self.state.menu = Menu.create("answer_style", "ANSWER STYLE", items)
+
+    def select_setting(self, kind: str, value: str) -> None:
+        assert self.engine is not None
+        engine, prefs = self.engine, self.preferences
+        if kind == "reasoning":
+            warning = prefs.set_reasoning(engine, value or None)
+            self.add_entry("info", f"Reasoning for {engine.model}: {label(value or None)}. "
+                                   "Applies from the next message.")
+        elif kind == "max_tokens" and value == "custom":
+            self.start_token_prompt()
+            return
+        elif kind == "max_tokens":
+            tokens = int(value) if value else None
+            warning = prefs.set_max_tokens(engine, tokens)
+            self.add_entry("info", f"Max output tokens for {engine.model}: "
+                                   f"{tokens or 'model default'}. Applies from the next message.")
+        else:
+            warning = prefs.set_answer_style(engine, value)
+            self.add_entry("info", f"Answer style: {value.capitalize()}. "
+                                   "Applies from the next message.")
+        self.sync_settings()
+        if warning:
+            self.add_entry("error", f"Warning: {warning}")
+
+    def start_token_prompt(self) -> None:
+        state = self.state
+        state.saved_input = (state.input_text, state.cursor)
+        state.input_text, state.cursor = "", 0
+        state.entering_tokens = True
+        limit = f" (1-{state.token_limit})" if state.token_limit else ""
+        self.add_entry("info", f"Type the max output tokens{limit} and press Enter; Esc cancels.")
+
+    def end_token_prompt(self) -> None:
+        state = self.state
+        state.entering_tokens = False
+        state.input_text, state.cursor = state.saved_input
+
+    def submit_custom_tokens(self, text: str) -> None:
+        """Validate a typed token limit; invalid input keeps the prompt open."""
+        assert self.engine is not None
+        if not text.isdigit():
+            self.add_entry("error", f"'{text}' is not a positive whole number. "
+                                    "Try again or press Esc.")
+            return
+        problem = check_max_tokens(int(text), self.state.token_limit, self.engine.model)
+        if problem:
+            self.add_entry("error", f"{problem} Try again or press Esc.")
+            return
+        self.end_token_prompt()
+        warning = self.preferences.set_max_tokens(self.engine, int(text))
+        self.add_entry("info", f"Max output tokens for {self.engine.model}: {int(text)}. "
+                               "Applies from the next message.")
+        self.sync_settings()
+        if warning:
+            self.add_entry("error", f"Warning: {warning}")
+
+    def sync_settings(self) -> None:
+        """Show the engine's effective values in the panel and status line."""
+        engine = self.engine
+        if engine is None:
+            return
+        self.settings = replace(
+            self.settings,
+            provider=engine.provider,
+            model=engine.model,
+            reasoning_effort=engine.reasoning_effort,
+            max_output_tokens=engine.max_output_tokens,
+            answer_style=engine.answer_style,
+        )
+
     def handle_menu_key(self, key: Key) -> None:
         menu = self.state.menu
         assert menu is not None
@@ -463,8 +616,10 @@ class TuiApp:
             self.state.menu = None
             if menu.kind == "provider":
                 self.select_provider(menu.selected.value)
-            else:
+            elif menu.kind == "model":
                 self.select_model(menu.selected.value)
+            else:
+                self.select_setting(menu.kind, menu.selected.value)
 
     def select_provider(self, name: str) -> None:
         assert self.engine is not None
@@ -490,17 +645,32 @@ class TuiApp:
         """Change provider/model and start a new conversation; history is never carried over."""
         assert self.engine is not None
         had_messages = bool(self.session.messages)
-        self.engine.select(provider, model)
+        engine = self.engine
+        engine.select(provider, model)
         warning = self.session.switch(provider, model)
-        self.settings = replace(self.settings, provider=provider, model=model)
-        notice = f"Now using {provider_label(provider)} / {model}. Started a new conversation"
-        if had_messages and self.session.persistent:
-            notice += "; the previous one stays saved."
-        elif had_messages:
-            notice += "; the previous messages are not sent to the new model."
+        # The new model gets its own saved reasoning/token choices, checked against it.
+        notices = self.run_busy("CHECKING MODEL SETTINGS", lambda: self.preferences.apply(engine))
+        self.sync_settings()
+        now_using = f"Now using {provider_label(provider)} / {model}."
+        if self.session.restored:
+            # Its own earlier conversation; nothing from the previous selection is sent.
+            self.clear_panel("")
+            self.state.entries.clear()
+            for message in self.session.messages:
+                self.add_entry("user" if message.role == "user" else "ai", message.content)
+            count = len(self.session.messages)
+            self.add_entry("info", f"{now_using} Restored its conversation ({count} messages).")
         else:
-            notice += "."
-        self.clear_panel(notice)
+            notice = f"{now_using} Started a new conversation"
+            if had_messages and self.session.persistent:
+                notice += "; the previous one stays saved."
+            elif had_messages:
+                notice += "; the previous messages are not sent to the new model."
+            else:
+                notice += "."
+            self.clear_panel(notice)
+        for message in notices or []:
+            self.add_entry("info", message)
         if warning:
             self.add_entry("error", f"Warning: {warning}")
 
@@ -654,6 +824,8 @@ class TuiApp:
             indicator = "[WAITING FOR RESPONSE...]"
         elif self.state.busy:
             indicator = f"[{self.state.busy}...]"
+        elif self.state.entering_tokens:
+            indicator = "[ENTER TOKEN LIMIT]"
         elif self.state.confirming_cleanup:
             indicator = f"[CONFIRM: TYPE {CLEANUP_CONFIRMATION.upper()}]"
         else:
@@ -665,7 +837,12 @@ class TuiApp:
         width = layout.inner_width
         indicator_x = 2 + max(0, width - len(indicator))
         self.put(layout.status_row, 2, details, self.styles.text, indicator_x - 1)
-        highlighted = self.state.waiting or self.state.busy or self.state.confirming_cleanup
+        highlighted = (
+            self.state.waiting
+            or self.state.busy
+            or self.state.entering_tokens
+            or self.state.confirming_cleanup
+        )
         style = self.styles.waiting if highlighted else self.styles.text
         self.put(layout.status_row, indicator_x, indicator, style, layout.cols - 2)
 
@@ -673,11 +850,12 @@ class TuiApp:
         state = self.state
         # Scroll horizontally so the cursor (which may sit after the last
         # character) always stays inside the field.
-        field_width = max(1, layout.inner_width - len(USER_LABEL))
+        prompt = TOKENS_LABEL if state.entering_tokens else USER_LABEL
+        field_width = max(1, layout.inner_width - len(prompt))
         start = max(0, state.cursor - field_width + 1)
         visible = state.input_text[start : start + field_width]
-        x = 2 + len(USER_LABEL)
-        self.put(layout.input_row, 2, USER_LABEL, self.styles.user, layout.cols - 2)
+        x = 2 + len(prompt)
+        self.put(layout.input_row, 2, prompt, self.styles.user, layout.cols - 2)
         self.put(layout.input_row, x, visible, self.styles.text, layout.cols - 2)
         try:
             self.screen.move(layout.input_row, x + state.cursor - start)
@@ -723,7 +901,7 @@ def settings_panel_lines(settings: ChatSettings, usage: TokenUsage | None) -> li
         ("F3 PROVIDER", "border"), value(provider_label(settings.provider)),
         ("F4 REASONING", "border"), value(settings.reasoning_effort or "default"),
         ("F5 MAX TOKENS", "border"), value(str(max_tokens) if max_tokens else "default"),
-        ("F6 ANSWER STYLE", "border"), value("default"),
+        ("F6 ANSWER STYLE", "border"), value(settings.answer_style or "default"),
         ("TOKENS", "border"),
     ]
     if usage is None:
@@ -780,6 +958,7 @@ def run_tui(
     reply_fn: ReplyFn,
     session: ChatSession | None = None,
     engine: ChatEngine | None = None,
+    preferences: Preferences | None = None,
 ) -> int:
     """Run the fullscreen chat. `curses.wrapper` restores the terminal on any exit."""
     try:
@@ -798,7 +977,7 @@ def run_tui(
             curses.set_escdelay(25)  # Esc closes menus; don't wait the default 1 s
         except (AttributeError, curses.error):
             pass
-        return TuiApp(screen, settings, reply_fn, styles, session, engine).run()
+        return TuiApp(screen, settings, reply_fn, styles, session, engine, preferences).run()
 
     try:
         return curses.wrapper(main)

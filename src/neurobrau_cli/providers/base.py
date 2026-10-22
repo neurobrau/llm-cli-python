@@ -52,11 +52,20 @@ class GenerationResult:
 
 @dataclass(frozen=True)
 class GenerationOptions:
-    """Per-request settings. Providers ignore options they do not support."""
+    """Per-request settings.
+
+    `reasoning_effort` uses the provider's vocabulary (see ReasoningSupport);
+    None means the provider's default policy. When `reasoning_explicit` is
+    set, the user chose the value: providers must report it as unsupported
+    instead of silently dropping it. `instructions` is a system/developer
+    instruction for this request only; it is not part of the conversation.
+    """
 
     model: str
     reasoning_effort: str | None = None
     max_output_tokens: int | None = None
+    instructions: str | None = None
+    reasoning_explicit: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,6 +76,28 @@ class ModelInfo:
     remote: bool = False  # runs on a remote service although listed locally
     capabilities: tuple[str, ...] | None = None  # None: not reported
     details: str = ""
+    context_length: int | None = None
+
+
+@dataclass(frozen=True)
+class ReasoningSupport:
+    """Which reasoning values a model accepts, as far as the provider can confirm.
+
+    `values` are selectable values in the provider's vocabulary (OpenAI:
+    efforts such as "low"; Ollama: "off"/"on" or named levels). `known=False`
+    means support could not be confirmed. `default` is what is used when the
+    user chose nothing; None sends no reasoning parameter. `allows_default`
+    offers "Default" (omit the parameter) as a choice.
+    """
+
+    values: tuple[str, ...] = ()
+    known: bool = False
+    default: str | None = None
+    allows_default: bool = True
+
+    @property
+    def supported(self) -> bool:
+        return bool(self.values)
 
 
 @dataclass(frozen=True)
@@ -95,4 +126,12 @@ class Provider(Protocol):
 
     def default_model(self) -> str:
         """Model used when none is chosen. Raises ProviderError if none can be determined."""
+        ...
+
+    def reasoning_support(self, model: str) -> ReasoningSupport:
+        """Confirmed reasoning values for a model. May make one cached request."""
+        ...
+
+    def max_output_limit(self, model: str) -> int | None:
+        """Largest allowed max-output-tokens value, if known. May use cached discovery."""
         ...

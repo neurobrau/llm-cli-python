@@ -43,7 +43,7 @@ only the conversation panel and the LLM SETTINGS panel next to it stretch
 vertically. Exact render at the baseline (input empty, Ollama selected):
 
 ```
-row  0  +-[ NeuroBräu CLI 0.1.0 ]---------------------------------+-[ LLM SETTINGS ]---+
+row  0  +-[ NeuroBräu CLI 0.2.0 ]---------------------------------+-[ LLM SETTINGS ]---+
 row  1  | YOU > What is a neural network?                         | F2 MODEL           |
 row  2  |                                                         |  qwen3.5:4b        |
 row  3  | AI > A neural network is a model made of layers of      | F3 PROVIDER        |
@@ -160,7 +160,7 @@ No animation, mouse support, images or other decoration.
 * Up/Down scroll by 1 line; PgUp/PgDn scroll by `panel height - 1` lines.
 * Submitting input (message or command) returns to the bottom.
 * While scrolled up, the title border reads
-  `[ NeuroBräu CLI 0.1.0 - scrolled up N (PgDn) ]`.
+  `[ NeuroBräu CLI 0.2.0 - scrolled up N (PgDn) ]`.
 
 ## 4a. LLM SETTINGS panel
 
@@ -172,15 +172,15 @@ indented by one space and clipped to 18 columns with `~` marking a cut
 |---|---|---|
 | 1–2 | `F2 MODEL` | current model ID |
 | 3–4 | `F3 PROVIDER` | `OpenAI` or `Ollama` |
-| 5–6 | `F4 REASONING` | `--reasoning-effort` value (display only for now) |
-| 7–8 | `F5 MAX TOKENS` | `--max-output-tokens` or `default` (display only) |
-| 9–10 | `F6 ANSWER STYLE` | `default` (display only) |
+| 5–6 | `F4 REASONING` | effective value in provider vocabulary (`none`, `low`, `off`, `on`, …) or `default` (no parameter sent) |
+| 7–8 | `F5 MAX TOKENS` | effective limit or `default` |
+| 9–10 | `F6 ANSWER STYLE` | `brief`, `normal` or `detailed` |
 | 11 | `TOKENS` | |
 | 12–13 | | ` in N out N` / ` total N`, or a single ` -` |
 
 Token values follow the status panel (last response; `?` for a missing count).
 
-## 4b. Selection menus (F2, F3)
+## 4b. Selection menus (F2–F6)
 
 A bordered box drawn over the conversation area:
 
@@ -192,8 +192,9 @@ A bordered box drawn over the conversation area:
 |             +-[ 1/2 Enter=OK Esc=cancel ]+              |
 ```
 
-* Title: `SELECT PROVIDER` or `SELECT <PROVIDER> MODEL` (provider label in
-  upper case). Footer: `<n>/<total> Enter=OK Esc=cancel`.
+* Title: `SELECT PROVIDER`, `SELECT <PROVIDER> MODEL` (provider label in
+  upper case), `REASONING`, `MAX OUTPUT TOKENS` or `ANSWER STYLE`.
+  Footer: `<n>/<total> Enter=OK Esc=cancel`.
 * Each item: `* ` for the current selection or two spaces, the label, and an
   optional note (Ollama: parameter size and quantization) right-aligned when
   it fits. The highlighted item is drawn in the selected style across the
@@ -232,17 +233,72 @@ the current provider's models (cached for the rest of the session), then
 opens the menu. Discovery errors become an error entry `Error: <message>`;
 an empty list gives `No selectable <Label> models were found.`
 
-**Switching** (provider or model) always starts a new conversation; the
-previous messages are never sent to the new provider or model. The panel
-is cleared, token usage reset, and an info entry is shown:
-`Now using <Label> / <model>. Started a new conversation` followed by
-`; the previous one stays saved.` (history enabled and the old
-conversation had messages), `; the previous messages are not sent to the new
-model.` (`--no-history`), or `.` (it was empty). See section 11 for storage.
+**Switching** (provider or model): every provider/model combination has its
+own conversation, and messages are never sent to a different combination.
+The panel is cleared and token usage reset. Then:
 
-**F4, F5, F6** append an info entry explaining that the setting is
-display-only for now (set via `--reasoning-effort` / `--max-output-tokens`).
+* **The target has a conversation** (from earlier in this run, or the most
+  recent one on disk): its messages are shown as normal entries, followed by
+  the info entry `Now using <Label> / <model>. Restored its conversation (<n> messages).`
+* **Otherwise** a new empty conversation starts, with the info entry
+  `Now using <Label> / <model>. Started a new conversation` followed by
+  `; the previous one stays saved.` (history enabled and the old
+  conversation had messages), `; the previous messages are not sent to the new
+  model.` (`--no-history`), or `.` (it was empty).
+
+Switching back and forth therefore returns to each conversation where it was
+left. See section 11 for storage.
+
 Ctrl+C during a check or discovery cancels it (`Cancelled.`).
+
+## 4c. Generation settings (F4, F5, F6)
+
+These change how the **next** request is made. They never clear the panel,
+never start a new conversation, and are saved per model (section 13). Each
+confirmed change appends an info entry ending in `Applies from the next
+message.` Menu navigation itself makes no requests.
+
+**F4 REASONING.** Shows `[CHECKING REASONING...]` while asking the provider
+which values the current model supports (OpenAI: built-in table, no request;
+Ollama: one cached `/api/show`). Items:
+
+| Support | Items |
+|---|---|
+| unknown (OpenAI model not in the table) | `Default (support unknown)` only, plus an info entry: `Reasoning support for <model> is not confirmed, so only the model's default is offered. --reasoning-effort sends a value explicitly.` |
+| none | no menu; info entry `<model> does not support reasoning.` |
+| values | `Default` (note `model default`; only where omitting the parameter is allowed) followed by the values with labels `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`, `Off`, `On` or the level name capitalized |
+
+`Default` sends no reasoning parameter. Ollama On/Off models offer no
+`Default`: thinking is always sent, `false` unless On is chosen.
+
+**F5 MAX OUTPUT TOKENS.** Shows `[CHECKING MODEL LIMITS...]` while reading
+the model's limit (OpenAI table; Ollama `context_length` from the cached
+`/api/tags`). Items: `Default` (note `model default`), `256`, `512`, `1024`,
+`2048`, `4096` (presets above a known limit are left out), then
+`Custom...` (note `up to <limit>` or `any positive number`; shown as
+`Custom (<n>)` when the current value is not a preset).
+
+`Custom...` turns the input line into a prompt: label `TOKENS > `, indicator
+`[ENTER TOKEN LIMIT]`, and the info entry
+`Type the max output tokens (1-<limit>) and press Enter; Esc cancels.` Any
+text typed before is set aside and restored afterwards. On Enter:
+* not digits: error `'<text>' is not a positive whole number. Try again or press Esc.`
+* `0`: error `Max output tokens must be a positive whole number, not 0. Try again or press Esc.`
+* above the limit: error `<n> exceeds the limit of <limit> output tokens for <model>. Try again or press Esc.`
+* otherwise the value is applied and the prompt closes.
+
+The prompt stays open after an error; Esc closes it with
+`Max output tokens unchanged.` F-keys are ignored while it is open.
+
+**F6 ANSWER STYLE.** `Brief` (`short, concise answers`), `Normal`
+(`standard answers`), `Detailed` (`thorough, with examples`). The style is
+sent as an instruction with each request (section 12) and is never stored
+in the conversation.
+
+**After switching** provider or model (F2/F3), the new model's saved
+reasoning and token choices are applied (`[CHECKING MODEL SETTINGS...]`);
+unsupported saved values fall back with an info entry (section 13). The
+answer style is global and stays.
 
 ## 5. Status panel
 
@@ -262,7 +318,8 @@ Right-aligned state indicator, in priority order:
 | Indicator | When | Style |
 |---|---|---|
 | `[WAITING FOR RESPONSE...]` | a request is in flight | waiting |
-| `[CHECKING OLLAMA...]`, `[LOADING OPENAI MODELS...]`, … | availability check or model discovery | waiting |
+| `[CHECKING OLLAMA...]`, `[LOADING OPENAI MODELS...]`, `[CHECKING REASONING...]`, … | availability, discovery or capability checks | waiting |
+| `[ENTER TOKEN LIMIT]` | the F5 custom-value prompt is open | waiting |
 | `[CONFIRM: TYPE YES]` | `/cleanup` is waiting for confirmation | waiting |
 | `[READY]` | otherwise | text |
 
@@ -294,10 +351,13 @@ The left text is truncated so it never overlaps the indicator.
 | Ctrl+C (waiting) | cancel the request, keep running |
 | F2 | model menu (section 4b) |
 | F3 | provider menu (section 4b) |
-| F4 / F5 / F6 | explain that the setting is display-only for now |
+| F4 | reasoning menu (section 4c) |
+| F5 | max output tokens menu (section 4c) |
+| F6 | answer style menu (section 4c) |
+| Esc | close the F5 custom-value prompt |
 
-Other keys are ignored, including Esc outside a menu. The help line reads
-` /help /reset /exit | F2 model F3 provider | PgUp/PgDn scroll | Ctrl+C quit`.
+Other keys are ignored, including Esc outside a menu or prompt. The help line reads
+` /help /reset /exit | F2-F6 settings | PgUp/PgDn scroll | Ctrl+C quit`.
 Esc is recognized after 25 ms (curses `set_escdelay`).
 
 ## 8. Submitting input
@@ -444,9 +504,10 @@ order shown and omit `provider`/`model` when unknown.
 * **Restore:** at interactive startup, load every `*.json` file and continue
   the valid matching one with the greatest `updated_at` (ties: newest file
   modification time). Matching:
-  * no `--provider` and no `--model`: any conversation; its `provider` and
-    `model` become the active selection (so the last conversation continues
-    with the same model, even across providers);
+  * no `--provider` and no `--model`: the provider/model in `active.json`
+    (below); if that file is missing or invalid (warning
+    `Ignoring invalid <path>.`), any conversation, whose `provider` and
+    `model` then become the active selection;
   * `--provider` only: conversations of that provider; its `model` is adopted;
   * `--model` (with or without `--provider`, which defaults to `openai`):
     conversations with exactly that provider and model.
@@ -455,10 +516,29 @@ order shown and omit `provider`/`model` when unknown.
 
   No match means a new conversation for the requested (or default)
   selection, written at its first successful exchange.
-* **Switching provider/model** (TUI F2/F3): a non-empty conversation stays
-  on disk and a new one (new `id`, `created_at`) is started; an empty one is
-  reused. The (possibly empty) conversation is saved immediately with the new
-  `provider`/`model`, so it is the one restored next time.
+* **Switching provider/model** (TUI F2/F3): the current conversation is set
+  aside (it is already saved after each exchange). The target selection's
+  conversation is restored: first one set aside earlier in this run, then the
+  most recent matching file (same rules as Restore). A restored file is
+  **not rewritten**; only `active.json` is updated. Without a match, a new
+  conversation starts and is saved immediately (empty `messages`) so the
+  selection is restored next time. An empty current conversation that is not
+  yet on disk is reused for it; one that is on disk (e.g. the empty
+  conversation `/reset` saved) stays with its own selection, so `/reset`
+  followed by switching away and back returns to the empty post-reset
+  conversation while the archived one is kept.
+* **`--no-history`:** the same per-selection behavior, in memory for the
+  current run only.
+* **`active.json`:** `<state dir>/neurobrau/active.json` (next to
+  `conversations/`, so `/cleanup` does not remove it) records the active
+  selection; written atomically with mode `0600` whenever it changes (after
+  a save or a switch):
+
+  ```json
+  {"schema_version": 1, "provider": "ollama", "model": "qwen3.5:4b"}
+  ```
+
+  An unknown provider in it is ignored at startup (defaults are used).
 * **Invalid files** (unreadable, not UTF-8, not JSON, failing the rules
   above) produce a startup warning
   `Ignoring unreadable conversation file <path>: <reason>. The file was left unchanged.`
@@ -474,7 +554,8 @@ order shown and omit `provider`/`model` when unknown.
   `id` and `created_at`, and save it immediately (empty `messages`) so it is
   the one restored next time. The old file is untouched.
 * **`/cleanup`:** after confirmation, delete every `*.json` file in the
-  directory, then start a new unsaved conversation.
+  directory, forget conversations set aside in this run, then start a new
+  unsaved conversation.
 * **`--no-history`:** no reads, writes or permission changes at all.
 * **Errors** (permissions, disk full, path is a file, …) are shown as
   `Could not <read|save|delete> conversation history at <path>: <reason>.`
@@ -495,7 +576,11 @@ rate limit 5, timeout 6, connection 7.
 | Credentials | `OPENAI_API_KEY` environment variable | none |
 | Server | SDK default | `OLLAMA_HOST` (`host`, `host:port` or URL), default `http://127.0.0.1:11434`; `0.0.0.0` means local |
 | Max tokens | `max_output_tokens` | `options.num_predict` |
-| Reasoning | `reasoning.effort`; if the API rejects that parameter for a model (HTTP 400, `param` starting with `reasoning`), retry once without it and remember the model for the session | `think`: sent only if the model reports the `thinking` capability; `false` unless an effort other than `none` is chosen |
+| Max tokens limit | built-in table (unknown models: none) | `details.context_length` from `/api/tags` |
+| Answer style | `instructions` parameter (system/developer message) | leading `{"role": "system"}` message |
+| Reasoning values | built-in table of confirmed efforts per model (exact ID or dated snapshot `-YYYY-MM-DD`); unknown models: none confirmed | `/api/show` `thinking.values`: `false`/`true` → `off`/`on`, strings → named levels; `thinking` capability without metadata → `off`/`on`; otherwise none |
+| Reasoning parameter | `reasoning.effort`, omitted for `Default` | `think`: sent only if the model has the `thinking` capability: `false` for none/`off`, `true` for `on` or an effort name on an On/Off model, the level string for named levels |
+| Rejected reasoning | value chosen by the user (CLI, F4, saved): error `<model> does not accept reasoning effort '<v>' (…)`, no retry. Built-in default: retry once without it and remember the model for the session | user-chosen thinking on a model without the capability, or an unknown level: error before any chat request |
 | Reasoning output | not requested | `message.thinking`, or a leading `<think>…</think>` block, is moved out of the answer |
 | Usage | input / output / total tokens | `prompt_eval_count` / `eval_count` / their sum |
 | Discovery | Models API, 5 s timeout, no retries; IDs containing `embedding`, `tts`, `whisper`, `dall-e`, `moderation`, `transcribe`, `realtime`, `audio`, `image` are hidden (heuristic) | `GET /api/tags`, 3 s timeout |
@@ -524,3 +609,72 @@ bypass HTTP proxies.
 Discovery results are cached per provider for the session; nothing is
 requested until a provider is used, F2/F3 is selected, or (Ollama without
 `--model`) a default model must be determined.
+
+## 13. Settings file
+
+Nonsecret preferences, separate from conversation history and credentials.
+
+### Location
+
+`$XDG_CONFIG_HOME/neurobrau/settings.json` if `XDG_CONFIG_HOME` is an
+absolute path, otherwise `~/.config/neurobrau/settings.json`. Directory
+`0700`, file `0600` where supported; written atomically like conversation
+files. API keys are never written.
+
+### Format (schema version 1)
+
+```json
+{
+  "schema_version": 1,
+  "answer_style": "brief",
+  "providers": {
+    "ollama": {"models": {
+      "qwen3.5:4b": {"reasoning": "on", "max_output_tokens": 600}
+    }},
+    "openai": {"models": {
+      "gpt-5": {"reasoning": "low"},
+      "gpt-6-luna": {"max_output_tokens": null}
+    }}
+  }
+}
+```
+
+| Field | Rules |
+|---|---|
+| `schema_version` | must be `1` |
+| `answer_style` | `brief`, `normal` or `detailed`; default `normal` |
+| `providers.<p>.models.<model>` | per provider and exact model ID (may contain `/` and `:`) |
+| `reasoning` | provider value (`none`, `low`, `off`, `on`, a level, …) or `"default"` = send no parameter; absent = not set |
+| `max_output_tokens` | positive integer, or `null` = explicitly "Default"; absent = not set |
+
+Unknown fields are ignored. Writers sort providers and models by name and
+omit empty entries. Invalid individual values are skipped with a warning;
+an unreadable or invalid file is reported, defaults are used, and the file
+is **never overwritten** in that session (changes show
+`Settings not saved: <path> could not be read at startup.`).
+
+### Effective values
+
+For the active provider/model, each setting is resolved in this order:
+
+1. **CLI flag** (`--reasoning-effort`, `--max-output-tokens`,
+   `--answer-style`) for this invocation only; never saved. A value the model
+   is known not to support is an error at startup (exit code 2). After the
+   user changes a setting interactively, that choice replaces the flag.
+2. **Saved preference** for the provider/model (answer style is global). A
+   saved value the model does not support (or no longer supports) is
+   ignored with a visible note, e.g.
+   `Saved reasoning 'High' is not available for m (m supports reasoning: Off, On); using Off.`
+   or `Saved setting ignored: 5000 exceeds the limit of 4096 output tokens for m. Using the default.`
+3. **Built-in default:** reasoning `none` where the model's confirmed efforts
+   include it (e.g. `gpt-6-luna`), Ollama `off` for thinking models,
+   otherwise no parameter; max tokens: model default; style: `normal`.
+
+CLI effort names apply to Ollama too: `none` → `off`, any other effort → `on`
+on On/Off models, or the same-named level. Explicit values for OpenAI
+models with unknown support are passed through (the API may reject them,
+which is reported). Notes are printed as `neurobrau: note: …` (one-shot)
+or `warning: …` (plain chat), or shown as entries in the TUI.
+
+Changing F4/F5 saves `reasoning` / `max_output_tokens` for the current
+provider/model; F6 saves `answer_style`.

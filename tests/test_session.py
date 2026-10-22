@@ -260,3 +260,166 @@ def test_legacy_file_without_metadata_counts_as_openai(store: HistoryStore) -> N
     assert not ChatSession.restore(store, provider="ollama").restored
     legacy = ChatSession.restore(store)
     assert (legacy.provider, legacy.model) == ("openai", None)
+
+
+# ----- Task 007b: per-selection conversations restored on switch -----
+
+
+class Recorder:
+    """Reply function that records what each request contained."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.seen: list[list[str]] = []
+
+    def __call__(self, messages: Sequence[Message]) -> GenerationResult:
+        self.seen.append([m.content for m in messages])
+        return GenerationResult(text=f"{self.label} reply {len(self.seen)}")
+
+
+def test_openai_ollama_openai_restores_each_conversation(store: HistoryStore) -> None:
+    openai, ollama = Recorder("openai"), Recorder("ollama")
+    session = ChatSession.restore(store, Clock(), provider="openai", model="gpt-x")
+    session.send("OpenAI topic", openai)
+
+    session.switch("ollama", "qwen3.5:4b")
+    assert session.messages == ()
+    session.send("Ollama topic", ollama)
+
+    session.switch("openai", "gpt-x")
+    assert session.restored
+    assert [m.content for m in session.messages] == ["OpenAI topic", "openai reply 1"]
+    session.send("Back again", openai)
+
+    session.switch("ollama", "qwen3.5:4b")
+    assert [m.content for m in session.messages] == ["Ollama topic", "ollama reply 1"]
+
+    assert openai.seen == [["OpenAI topic"], ["OpenAI topic", "openai reply 1", "Back again"]]
+    assert ollama.seen == [["Ollama topic"]]  # never sees OpenAI history
+    assert len(store.list_paths()) == 2
+
+
+def test_two_models_of_one_provider_stay_separate(store: HistoryStore) -> None:
+    session = ChatSession.restore(store, Clock(), provider="ollama", model="qwen3.5:4b")
+    session.send("Qwen chat", echo)
+    session.switch("ollama", "llama3.2:3b")
+    session.send("Llama chat", echo)
+
+    session.switch("ollama", "qwen3.5:4b")
+
+    assert [m.content for m in session.messages] == ["Qwen chat", "echo: Qwen chat"]
+    session.switch("ollama", "llama3.2:3b")
+    assert [m.content for m in session.messages] == ["Llama chat", "echo: Llama chat"]
+
+
+def test_switching_restores_from_disk_in_a_new_process(store: HistoryStore) -> None:
+    clock = Clock()
+    first = ChatSession.restore(store, clock, provider="openai", model="gpt-x")
+    first.send("Saved OpenAI chat", echo)
+    first.switch("ollama", "qwen3.5:4b")
+    first.send("Saved Ollama chat", echo)
+
+    second = ChatSession.restore(store, clock)  # restart: resumes the active selection
+    assert (second.provider, second.model) == ("ollama", "qwen3.5:4b")
+    assert second.messages[0].content == "Saved Ollama chat"
+
+    second.switch("openai", "gpt-x")
+    assert second.restored
+    assert second.messages[0].content == "Saved OpenAI chat"
+
+
+def test_restart_resumes_selection_restored_by_switching(store: HistoryStore) -> None:
+    clock = Clock()
+    session = ChatSession.restore(store, clock, provider="openai", model="gpt-x")
+    session.send("OpenAI chat", echo)
+    session.switch("ollama", "qwen3.5:4b")
+    session.send("Ollama chat", echo)
+    session.switch("openai", "gpt-x")  # restored, nothing new sent
+
+    restarted = ChatSession.restore(store, clock)
+
+    assert (restarted.provider, restarted.model) == ("openai", "gpt-x")
+    assert restarted.messages[0].content == "OpenAI chat"
+
+
+def test_restoring_does_not_rewrite_conversation_files(store: HistoryStore) -> None:
+    session = ChatSession.restore(store, Clock(), provider="openai", model="gpt-x")
+    session.send("Keep me", echo)
+    openai_file = store.path_for(session.id)
+    before = openai_file.read_bytes()
+    session.switch("ollama", "qwen3.5:4b")
+    restarted = ChatSession.restore(store, Clock())
+    mtime = openai_file.stat().st_mtime_ns
+
+    restarted.switch("openai", "gpt-x")
+
+    assert openai_file.read_bytes() == before
+    assert openai_file.stat().st_mtime_ns == mtime
+
+
+def test_reset_then_switch_then_back_keeps_reset_state(store: HistoryStore) -> None:
+    clock = Clock()
+    session = ChatSession.restore(store, clock, provider="openai", model="gpt-x")
+    session.send("Archived topic", echo)
+    archived_id = session.id
+    session.reset()
+    fresh_id = session.id
+
+    session.switch("ollama", "qwen3.5:4b")
+    session.send("Ollama chat", echo)
+    session.switch("openai", "gpt-x")
+
+    assert session.id == fresh_id
+    assert session.messages == ()  # the post-reset conversation, not the archived one
+    archived = store.load(store.path_for(archived_id))
+    assert archived.messages[0].content == "Archived topic"
+    assert len(store.list_paths()) == 3
+
+
+def test_switch_without_history_restores_within_the_run() -> None:
+    session = ChatSession(provider="openai", model="gpt-x")
+    session.send("In memory", echo)
+    session.switch("ollama", "qwen3.5:4b")
+    session.send("Other", echo)
+
+    session.switch("openai", "gpt-x")
+
+    assert session.messages[0].content == "In memory"
+    assert not session.persistent
+
+
+def test_active_selection_file(store: HistoryStore) -> None:
+    session = ChatSession.restore(store, provider="openai", model="gpt-x")
+    session.send("Hi", echo)
+    session.switch("ollama", "qwen3.5:4b")
+
+    data = json.loads(store.active_path.read_text())
+
+    assert data == {"schema_version": 1, "provider": "ollama", "model": "qwen3.5:4b"}
+    assert store.active_path.parent == store.directory.parent  # not touched by /cleanup
+
+
+@pytest.mark.parametrize("content", ["{", '{"schema_version": 1, "provider": ""}', "[]"])
+def test_invalid_active_file_is_reported_and_ignored(store: HistoryStore, content: str) -> None:
+    session = ChatSession.restore(store, Clock(), provider="openai", model="gpt-x")
+    session.send("Latest", echo)
+    store.active_path.write_text(content)
+
+    restarted = ChatSession.restore(store)
+
+    assert restarted.messages[0].content == "Latest"  # falls back to the newest conversation
+    assert any("active.json" in warning for warning in restarted.startup_warnings)
+    assert store.active_path.read_text() == content
+
+
+def test_cleanup_then_switch_back_starts_empty(store: HistoryStore) -> None:
+    session = ChatSession.restore(store, provider="openai", model="gpt-x")
+    session.send("Gone soon", echo)
+    session.switch("ollama", "qwen3.5:4b")
+    session.cleanup()
+
+    session.switch("openai", "gpt-x")
+
+    assert session.messages == ()  # deleted conversations do not come back from memory
+    remaining = [store.load(path) for path in store.list_paths()]
+    assert [(c.provider, c.messages) for c in remaining] == [("openai", ())]  # the new empty one

@@ -24,6 +24,7 @@ neurobrau "What is a neural network?"
 neurobrau --model MODEL_ID --reasoning-effort low --max-output-tokens 200 --usage "Explain backprop"
 neurobrau --provider ollama --model qwen3.5:4b "Hello"
 neurobrau --provider ollama "Hello"     # first local model listed by Ollama
+neurobrau --answer-style brief "Explain recursion"
 ```
 
 Interactive chat (no prompt argument; model options still apply):
@@ -35,13 +36,34 @@ neurobrau --model MODEL_ID --usage
 neurobrau --provider ollama
 ```
 
-Without `--provider`/`--model`, an interactive chat continues the most recent
-conversation with the provider and model it was held with. In the fullscreen
-UI, the **LLM SETTINGS** panel shows the current selection; **F2** picks a
-model and **F3** a provider (OpenAI or Ollama) from DOS-style menus. Changing
-either starts a new conversation (the previous one stays saved) and never
-sends earlier messages to the new model. F4–F6 (reasoning, max tokens,
-answer style) are display-only for now.
+Without `--provider`/`--model`, an interactive chat continues with the
+provider and model that were active last time, and their conversation. In
+the fullscreen UI, the **LLM SETTINGS** panel shows the current selection;
+**F2** picks a model and **F3** a provider (OpenAI or Ollama) from DOS-style
+menus. Every provider/model combination keeps its own conversation:
+switching brings back that combination's most recent conversation (or starts
+an empty one), and messages are never sent to a different model. Switching
+back returns to where you left off, also after a restart.
+
+Generation settings change from the next message on and keep the conversation:
+
+| Key | Setting | Choices |
+|---|---|---|
+| F4 | Reasoning | only values confirmed for the model: OpenAI efforts from a built-in table (unknown models: Default only); Ollama Off/On or named levels from `/api/show` |
+| F5 | Max output tokens | Default, 256, 512, 1024, 2048, 4096, Custom (validated against the model's limit when known) |
+| F6 | Answer style | Brief, Normal, Detailed (sent as a system/developer instruction, not stored in the conversation) |
+
+Ollama thinking output is kept out of the answer.
+
+## Settings
+
+F4–F6 choices are saved in `$XDG_CONFIG_HOME/neurobrau/settings.json`
+(default `~/.config/neurobrau/settings.json`): reasoning and max tokens per
+provider/model, answer style globally. The file never contains API keys and
+is separate from conversation history. CLI flags (`--reasoning-effort`,
+`--max-output-tokens`, `--answer-style`) override saved values for one run
+and are not saved. A saved value the model does not support is ignored with
+a visible note. Format: [docs/tui-spec.md](docs/tui-spec.md#13-settings-file).
 
 Ollama models are discovered via `/api/tags`. Cloud models that Ollama lists
 (e.g. `glm-4.7:cloud`) run on a remote service and are excluded from
@@ -113,7 +135,10 @@ already in your scrollback). The transcript includes restored messages.
 
 - OpenAI's model list hides obvious non-text models by name; other listed
   models may still be rejected by the Responses API (shown as an error).
-  Models that reject the reasoning parameter are retried once without it.
+- OpenAI reasoning choices come from a small built-in table
+  (`KNOWN_MODELS` in `providers/openai_provider.py`); other models offer
+  only Default in F4. A model that rejects a built-in default is retried
+  once without it; a value you chose is reported as an error instead.
 - Reasoning returned by Ollama is kept separate and currently not shown.
 - Discovery and availability checks block the UI briefly (bounded by 5 s for
   OpenAI and 3 s for Ollama). Ollama chat requests time out after 300 s.
@@ -127,6 +152,13 @@ already in your scrollback). The transcript includes restored messages.
 - No streaming yet.
 - The fullscreen UI counts one column per character; wide characters (CJK,
   emoji) may misalign.
+
+## Version
+
+The version is defined once, as `__version__` in
+`src/neurobrau_cli/__init__.py`; `pyproject.toml` reads it at build time
+(`dynamic = ["version"]`). After changing it, reinstall
+(`.venv/bin/pip install -e '.[dev]'`) so the installed metadata matches.
 
 ## Tests
 

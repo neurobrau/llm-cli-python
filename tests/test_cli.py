@@ -1,11 +1,14 @@
 """Tests for the command-line interface."""
 
+import curses
 import json
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+from neurobrau_cli import __version__
 
 from neurobrau_cli import cli
 from neurobrau_cli.cli import main
@@ -59,7 +62,14 @@ def test_version_prints_version_and_exits_successfully(
         main(["--version"])
 
     assert exc_info.value.code == 0
-    assert capsys.readouterr().out.strip() == "neurobrau 0.1.0"
+    assert capsys.readouterr().out.strip() == "neurobrau 0.2.0"
+
+
+def test_installed_metadata_matches_the_single_version_source() -> None:
+    import importlib.metadata
+
+    assert __version__ == "0.2.0"
+    assert importlib.metadata.version("neurobrau-llm-cli") == __version__
 
 
 @pytest.fixture
@@ -93,7 +103,7 @@ def test_no_arguments_starts_interactive_chat(
 
     assert main([]) == 0
     out = capsys.readouterr().out
-    assert "NeuroBräu CLI 0.1.0" in out
+    assert f"NeuroBräu CLI {__version__}" in out
     assert "Provider: openai | Model: gpt-6-luna" in out
     fake_chat_backend.assert_not_called()
 
@@ -312,7 +322,7 @@ def test_falls_back_to_plain_chat_when_curses_is_unavailable(
     feed_input(monkeypatch)
 
     assert main([]) == 0
-    assert "NeuroBräu CLI 0.1.0" in capsys.readouterr().out
+    assert f"NeuroBräu CLI {__version__}" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -628,3 +638,222 @@ def test_provider_choices_exclude_unsupported(capsys: pytest.CaptureFixture[str]
         main(["--provider", "anthropic", "Hi"])
 
     assert "invalid choice" in capsys.readouterr().err
+
+
+# ----- Task 007: settings, --answer-style, overrides -----
+
+
+def write_settings(tmp_path: Path, data: dict) -> Path:
+    path = tmp_path / "config" / "neurobrau" / "settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"schema_version": 1, **data}))
+    return path
+
+
+def test_help_lists_answer_style(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--help"])
+
+    assert "--answer-style {brief,normal,detailed}" in capsys.readouterr().out
+
+
+def test_answer_style_one_shot_openai(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = MagicMock(return_value=GenerationResult(text="Short."))
+    monkeypatch.setattr(cli.openai_provider, "generate_text", fake)
+
+    main(["--answer-style", "brief", "Hi"])
+
+    assert "concise" in fake.call_args.kwargs["instructions"]
+    assert fake.call_args.kwargs["reasoning_effort"] == "none"
+
+
+def test_saved_settings_apply_to_one_shot_and_cli_overrides_them(
+    fake_generate: MagicMock, tmp_path: Path
+) -> None:
+    write_settings(tmp_path, {
+        "answer_style": "detailed",
+        "providers": {"openai": {"models": {"gpt-5": {"reasoning": "low", "max_output_tokens": 900}}}},
+    })
+
+    main(["--model", "gpt-5", "Hi"])
+    saved = fake_generate.call_args.kwargs
+    main(["--model", "gpt-5", "--reasoning-effort", "high", "--max-output-tokens", "50",
+          "--answer-style", "normal", "Hi"])
+    overridden = fake_generate.call_args.kwargs
+
+    assert (saved["reasoning_effort"], saved["max_output_tokens"]) == ("low", 900)
+    assert "example" in saved["instructions"]
+    assert (overridden["reasoning_effort"], overridden["max_output_tokens"]) == ("high", 50)
+    assert "instructions" not in overridden
+
+
+def test_cli_flags_are_not_saved(fake_generate: MagicMock, tmp_path: Path) -> None:
+    main(["--answer-style", "brief", "--max-output-tokens", "99", "Hi"])
+
+    assert not (tmp_path / "config").exists()
+
+
+def test_unsupported_reasoning_for_known_model_is_a_usage_error(
+    fake_generate: MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["--model", "gpt-4o", "--reasoning-effort", "high", "Hi"]) == 2
+
+    assert "gpt-4o does not support reasoning" in capsys.readouterr().err
+    fake_generate.assert_not_called()
+
+
+def test_token_limit_over_known_maximum_is_a_usage_error(
+    fake_generate: MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["--model", "gpt-4o", "--max-output-tokens", "20000", "Hi"]) == 2
+
+    assert "exceeds the limit of 16384" in capsys.readouterr().err
+
+
+def test_unsupported_saved_setting_falls_back_with_visible_note(
+    fake_generate: MagicMock, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_settings(tmp_path, {"providers": {"openai": {"models": {"gpt-6-luna": {"reasoning": "max"}}}}})
+
+    assert main(["Hi"]) == 0
+
+    assert fake_generate.call_args.kwargs["reasoning_effort"] == "none"
+    assert "note: Saved reasoning 'Max' is not available for gpt-6-luna" in capsys.readouterr().err
+
+
+def test_corrupt_settings_do_not_break_one_shot(
+    fake_generate: MagicMock, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = write_settings(tmp_path, {})
+    path.write_text("{oops")
+
+    assert main(["Hi"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "Paris.\n"
+    assert "Ignoring invalid settings file" in captured.err
+    assert path.read_text() == "{oops"
+
+
+def test_ollama_one_shot_style_and_saved_thinking(fake_ollama: FakeOllama, tmp_path: Path) -> None:
+    write_settings(tmp_path, {
+        "answer_style": "brief",
+        "providers": {"ollama": {"models": {"qwen3.5:4b": {"reasoning": "on", "max_output_tokens": 300}}}},
+    })
+
+    main(["--provider", "ollama", "--model", "qwen3.5:4b", "Hi"])
+
+    payload = fake_ollama.chat_payloads[0]
+    assert payload["messages"][0]["role"] == "system"
+    assert payload["messages"][1:] == [{"role": "user", "content": "Hi"}]
+    assert payload["think"] is True
+    assert payload["options"] == {"num_predict": 300}
+
+
+def test_ollama_one_shot_default_makes_no_show_request(fake_ollama: FakeOllama) -> None:
+    main(["--provider", "ollama", "--model", "qwen3.5:4b", "Hi"])
+
+    assert fake_ollama.paths == ["/api/tags", "/api/chat"]
+
+
+def test_plain_chat_shows_settings_fallback_and_uses_saved_style(
+    fake_ollama: FakeOllama,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    write_settings(tmp_path, {
+        "answer_style": "detailed",
+        "providers": {"ollama": {"models": {"qwen3.5:4b": {"reasoning": "ultra"}}}},
+    })
+    feed_input(monkeypatch, "Hi")
+
+    assert main(["--provider", "ollama", "--plain"]) == 0
+
+    err = capsys.readouterr().err
+    assert "warning: Saved reasoning 'Ultra' is not available for qwen3.5:4b" in err
+    payload = fake_ollama.chat_payloads[0]
+    assert payload["think"] is False and "example" in payload["messages"][0]["content"]
+
+
+def test_tui_receives_preferences(fake_chat_backend: MagicMock, fake_tui: MagicMock) -> None:
+    main(["--answer-style", "brief"])
+
+    kwargs = fake_tui.run_tui.call_args.kwargs
+    assert kwargs["preferences"].answer_style == "brief"
+    assert kwargs["engine"].answer_style == "brief"
+    assert fake_tui.run_tui.call_args.args[0].answer_style == "brief"
+
+
+def test_interactive_cli_value_unsupported_is_usage_error(
+    fake_chat_backend: MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["--model", "gpt-4o", "--reasoning-effort", "low"]) == 2
+
+    assert "gpt-4o does not support reasoning" in capsys.readouterr().err
+
+
+# ----- Task 007b: restoration across restarts -----
+
+
+def test_restart_restores_per_provider_conversations(
+    fake_chat_backend: MagicMock,
+    fake_ollama: FakeOllama,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    feed_input(monkeypatch, "OpenAI one")
+    main([])  # openai (default)
+    feed_input(monkeypatch, "Ollama one")
+    main(["--provider", "ollama"])
+
+    feed_input(monkeypatch, "Ollama two")
+    main([])  # resumes the active selection: Ollama
+    assert [m["content"] for m in fake_ollama.chat_payloads[-1]["messages"]] == [
+        "Ollama one", "local reply 1", "Ollama two"
+    ]
+
+    feed_input(monkeypatch, "OpenAI two")
+    main(["--provider", "openai"])
+    assert [m.content for m in fake_chat_backend.call_args.args[0]] == [
+        "OpenAI one", "Hello!", "OpenAI two"
+    ]
+    assert "Restored conversation from" in capsys.readouterr().out
+
+
+def test_tui_switch_is_resumed_after_restart(
+    fake_chat_backend: MagicMock,
+    fake_ollama: FakeOllama,
+    curses_with_fake_screen: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    curses_with_fake_screen["keys"] = [*type_keys("OpenAI chat"), curses.KEY_F3, curses.KEY_DOWN,
+                                       "\n", *type_keys("Ollama chat", "/exit")]
+    main([])
+    curses_with_fake_screen["keys"] = [curses.KEY_F3, curses.KEY_UP, "\n", *type_keys("/exit")]
+    main([])  # resumes Ollama, then switches back to OpenAI (restored, not rewritten)
+    capsys.readouterr()
+
+    monkeypatch.setattr(cli, "is_fullscreen_terminal", lambda: False)
+    feed_input(monkeypatch, "Plain follow-up")
+    main([])  # plain chat after restart: OpenAI was active last
+
+    assert [m.content for m in fake_chat_backend.call_args.args[0]] == [
+        "OpenAI chat", "Hello!", "Plain follow-up"
+    ]
+
+
+def test_unknown_provider_in_active_file_falls_back(
+    fake_chat_backend: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_state_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    active = isolated_state_home / "neurobrau" / "active.json"
+    active.parent.mkdir(parents=True)
+    active.write_text('{"schema_version": 1, "provider": "anthropic", "model": "x"}')
+    feed_input(monkeypatch, "Hi")
+
+    assert main([]) == 0
+    assert "Provider: openai" in capsys.readouterr().out

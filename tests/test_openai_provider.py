@@ -312,3 +312,82 @@ def test_other_bad_requests_are_not_retried() -> None:
 
 def test_provider_default_model() -> None:
     assert openai_provider.OpenAIProvider().default_model() == "gpt-6-luna"
+
+
+# ----- Task 007: capabilities, instructions, explicit reasoning -----
+
+
+@pytest.mark.parametrize(
+    ("model", "values", "known", "limit"),
+    [
+        ("gpt-6-luna", ("none",), True, None),
+        ("gpt-5", ("minimal", "low", "medium", "high"), True, 128_000),
+        ("gpt-5-2025-08-07", ("minimal", "low", "medium", "high"), True, 128_000),
+        ("gpt-4o", (), True, 16_384),
+        ("gpt-5-preview-xyz", (), False, None),  # not a dated snapshot: unknown
+        ("my-fine-tune", (), False, None),
+    ],
+)
+def test_known_capabilities(model: str, values: tuple, known: bool, limit: int | None) -> None:
+    provider = openai_provider.OpenAIProvider()
+
+    support = provider.reasoning_support(model)
+
+    assert (support.values, support.known) == (values, known)
+    assert provider.max_output_limit(model) == limit
+
+
+def test_capability_lookup_makes_no_request() -> None:
+    client = make_client()
+    provider = openai_provider.OpenAIProvider(client)
+
+    provider.reasoning_support("gpt-5")
+    provider.max_output_limit("gpt-5")
+
+    assert client.mock_calls == []
+
+
+def test_instructions_are_sent_separately_from_input() -> None:
+    client = make_client()
+
+    openai_provider.OpenAIProvider(client).generate(
+        [Message("user", "Hi")], GenerationOptions("gpt-x", None, None, instructions="Be brief.")
+    )
+
+    kwargs = client.responses.create.call_args.kwargs
+    assert kwargs["instructions"] == "Be brief."
+    assert kwargs["input"] == [{"role": "user", "content": "Hi"}]
+    assert "reasoning" not in kwargs
+
+
+def test_one_shot_instructions() -> None:
+    client = make_client()
+
+    openai_provider.generate_text("Hi", "gpt-x", None, client=client, instructions="Be brief.")
+
+    assert client.responses.create.call_args.kwargs["instructions"] == "Be brief."
+
+
+def test_explicit_reasoning_rejection_is_reported_not_retried() -> None:
+    rejection = make_status_error(openai.BadRequestError, 400, "Unsupported value")
+    rejection.param = "reasoning.effort"
+    client = make_client()
+    client.responses.create.side_effect = rejection
+    options = GenerationOptions("gpt-x", "high", reasoning_explicit=True)
+
+    with pytest.raises(OpenAIProviderError, match="does not accept reasoning effort 'high'.*F4"):
+        openai_provider.OpenAIProvider(client).generate([Message("user", "Hi")], options)
+
+    assert client.responses.create.call_count == 1
+
+
+def test_rejected_default_marks_model_as_without_reasoning() -> None:
+    rejection = make_status_error(openai.BadRequestError, 400, "Unsupported parameter")
+    rejection.param = "reasoning.effort"
+    client = make_client("ok")
+    client.responses.create.side_effect = [rejection, client.responses.create.return_value]
+    provider = openai_provider.OpenAIProvider(client)
+
+    provider.generate([Message("user", "Hi")], GenerationOptions("gpt-6-luna", "none"))
+
+    assert provider.reasoning_support("gpt-6-luna").values == ()

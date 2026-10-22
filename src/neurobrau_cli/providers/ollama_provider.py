@@ -23,6 +23,7 @@ from neurobrau_cli.providers.base import (
     GenerationResult,
     ModelInfo,
     ProviderError,
+    ReasoningSupport,
     TokenUsage,
 )
 
@@ -154,11 +155,13 @@ def parse_tag_entry(entry: object) -> ModelInfo:
     summary = " ".join(
         str(details[key]) for key in ("parameter_size", "quantization_level") if details.get(key)
     )
+    context = details.get("context_length")
     return ModelInfo(
         id=model_id,
         remote=remote,
         capabilities=tuple(capabilities) if isinstance(capabilities, list) else None,
         details=summary,
+        context_length=context if isinstance(context, int) and context > 0 else None,
     )
 
 
@@ -207,8 +210,42 @@ def parse_chat_response(data: object) -> GenerationResult:
     return GenerationResult(text=text, usage=usage, reasoning=reasoning)
 
 
-def to_ollama_messages(messages: Sequence[Message]) -> list[dict[str, str]]:
-    return [{"role": message.role, "content": message.content} for message in messages]
+def to_ollama_messages(
+    messages: Sequence[Message], instructions: str | None = None
+) -> list[dict[str, str]]:
+    """Chat messages, with `instructions` as a leading system message for this request only."""
+    converted = [{"role": message.role, "content": message.content} for message in messages]
+    if instructions:
+        converted.insert(0, {"role": "system", "content": instructions})
+    return converted
+
+
+def thinking_support(capabilities: tuple[str, ...], show: object) -> ReasoningSupport:
+    """Reasoning choices from `/api/show`'s `thinking` metadata.
+
+    `{"values": [false, true]}` gives Off/On; string values are named levels.
+    A model with the `thinking` capability but no metadata gets Off/On, the
+    generic `think` boolean. Models without the capability get no choices.
+    """
+    metadata = show.get("thinking") if isinstance(show, dict) else None
+    reported = metadata.get("values") if isinstance(metadata, dict) else None
+    values: list[str] = []
+    if isinstance(reported, list) and reported:
+        for value in reported:
+            if value is False:
+                values.append("off")
+            elif value is True:
+                values.append("on")
+            elif isinstance(value, str) and value:
+                values.append(value)
+    elif "thinking" in capabilities:
+        values = ["off", "on"]
+    if not values:
+        return ReasoningSupport(known=True)
+    off = "off" in values
+    # Without a choice, thinking is off where possible (the Task 006 default).
+    return ReasoningSupport(tuple(values), known=True, default="off" if off else None,
+                            allows_default=not off)
 
 
 # ----- provider -----
@@ -232,7 +269,7 @@ class OllamaProvider:
         self.chat_timeout = chat_timeout
         self.discovery_timeout = discovery_timeout
         self._models: list[ModelInfo] | None = None  # everything /api/tags reported
-        self._capabilities: dict[str, tuple[str, ...]] = {}  # from /api/show
+        self._show: dict[str, Any] = {}  # /api/show replies, per model
 
     def request(self, method: str, path: str, payload: dict[str, Any] | None, timeout: float) -> Any:
         return self.transport(method, f"{self.base_url}{path}", payload, timeout)
@@ -285,15 +322,48 @@ class OllamaProvider:
     def find(models: list[ModelInfo], model_id: str) -> ModelInfo | None:
         return next((model for model in models if model.id == model_id), None)
 
+    def show(self, model: ModelInfo) -> Any:
+        """One cached /api/show request. Only ever called for local models."""
+        if model.id not in self._show:
+            self._show[model.id] = self.request(
+                "POST", "/api/show", {"model": model.id}, self.discovery_timeout
+            )
+        return self._show[model.id]
+
     def capabilities(self, model: ModelInfo) -> tuple[str, ...]:
-        """Capabilities from /api/tags, or one /api/show request if tags omit them."""
+        """Capabilities from /api/tags, or from /api/show if tags omit them."""
         if model.capabilities is not None:
             return model.capabilities
-        if model.id not in self._capabilities:
-            data = self.request("POST", "/api/show", {"model": model.id}, self.discovery_timeout)
-            reported = data.get("capabilities") if isinstance(data, dict) else None
-            self._capabilities[model.id] = tuple(reported) if isinstance(reported, list) else ()
-        return self._capabilities[model.id]
+        data = self.show(model)
+        reported = data.get("capabilities") if isinstance(data, dict) else None
+        return tuple(reported) if isinstance(reported, list) else ()
+
+    def reasoning_support(self, model_id: str) -> ReasoningSupport:
+        model = self.local_model(model_id)
+        return thinking_support(self.capabilities(model), self.show(model))
+
+    def max_output_limit(self, model_id: str) -> int | None:
+        """The model's context length from /api/tags; num_predict cannot usefully exceed it."""
+        return self.local_model(model_id).context_length
+
+    def think_value(self, model: ModelInfo, options: GenerationOptions) -> bool | str:
+        """Map a reasoning value to Ollama's `think` parameter (model supports thinking)."""
+        value = options.reasoning_effort
+        if value in (None, "none", "off"):
+            return False
+        if value == "on":
+            return True
+        support = self.reasoning_support(model.id)
+        if value in support.values:
+            return value  # a named level such as "high"
+        if "on" in support.values:
+            return True  # an effort name (e.g. --reasoning-effort low) on an On/Off model
+        if options.reasoning_explicit:
+            raise OllamaProviderError(
+                f"{model.id} does not support thinking level '{value}'. "
+                f"Supported: {', '.join(support.values)}."
+            )
+        return True
 
     # ----- generation -----
 
@@ -301,12 +371,17 @@ class OllamaProvider:
         model = self.local_model(options.model)
         payload: dict[str, Any] = {
             "model": model.id,
-            "messages": to_ollama_messages(messages),
+            "messages": to_ollama_messages(messages, options.instructions),
             "stream": False,
         }
         if "thinking" in self.capabilities(model):
-            # Thinking is off unless a reasoning effort other than "none" is requested.
-            payload["think"] = options.reasoning_effort not in (None, "none")
+            # Thinking is off unless another value is requested.
+            payload["think"] = self.think_value(model, options)
+        elif options.reasoning_explicit and options.reasoning_effort not in (None, "none", "off"):
+            raise OllamaProviderError(
+                f"{model.id} does not support thinking; turn reasoning off (F4) "
+                "or choose another model."
+            )
         if options.max_output_tokens is not None:
             payload["options"] = {"num_predict": options.max_output_tokens}
         try:

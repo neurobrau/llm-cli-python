@@ -13,7 +13,15 @@ from neurobrau_cli.engine import ChatEngine
 from neurobrau_cli.formatting import format_transcript, format_usage
 from neurobrau_cli.providers import ollama_provider, openai_provider
 from neurobrau_cli.providers.base import ErrorKind, GenerationOptions, Provider, ProviderError
+from neurobrau_cli.preferences import Overrides, Preferences, resolve_model_settings
 from neurobrau_cli.session import ChatSession
+from neurobrau_cli.settings import (
+    ANSWER_STYLES,
+    STYLE_INSTRUCTIONS,
+    SettingsError,
+    SettingsStore,
+    default_settings_path,
+)
 from neurobrau_cli.storage import HistoryStore, default_history_dir
 
 PROG_NAME = "neurobrau"
@@ -84,15 +92,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reasoning-effort",
         choices=openai_provider.REASONING_EFFORTS,
-        default=openai_provider.DEFAULT_REASONING_EFFORT,
         metavar="EFFORT",
-        help="reasoning effort: %(choices)s (default: %(default)s)",
+        help=(
+            "reasoning effort: %(choices)s. Default: the saved choice for the model, "
+            "else none where the model supports it (Ollama: thinking off)"
+        ),
     )
     parser.add_argument(
         "--max-output-tokens",
         type=positive_int,
         metavar="N",
-        help="maximum number of tokens to generate",
+        help="maximum number of tokens to generate (default: saved choice, else the model's)",
+    )
+    parser.add_argument(
+        "--answer-style",
+        choices=ANSWER_STYLES,
+        help="brief, normal or detailed answers (default: saved choice, else normal)",
     )
     parser.add_argument(
         "--usage",
@@ -130,25 +145,67 @@ def report(error: ProviderError, stderr: TextIO) -> int:
     return EXIT_CODES[error.kind]
 
 
+def report_settings_error(error: SettingsError, stderr: TextIO) -> int:
+    print(f"{PROG_NAME}: error: {error}", file=stderr)
+    return EXIT_USAGE_ERROR
+
+
+def overrides_from(args: argparse.Namespace) -> Overrides:
+    return Overrides(args.reasoning_effort, args.max_output_tokens, args.answer_style)
+
+
+def load_preferences(args: argparse.Namespace) -> tuple[Preferences, list[str]]:
+    """Saved settings (never credentials) plus this invocation's CLI flags."""
+    try:
+        store = SettingsStore(default_settings_path())
+    except RuntimeError:  # home directory cannot be determined
+        return Preferences(overrides=overrides_from(args)), [
+            "Cannot determine the home directory; settings are not loaded or saved."
+        ]
+    settings, warnings = store.load()
+    return Preferences(store, settings, overrides_from(args)), warnings
+
+
 def run_prompt(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
     """Send the prompt to the provider and print the result."""
     provider_name = args.provider or DEFAULT_PROVIDER
+    preferences, warnings = load_preferences(args)
+    provider = create_providers()[provider_name]
+    instructions = STYLE_INSTRUCTIONS[preferences.answer_style]
     try:
+        model = args.model or provider.default_model()
+        resolved, notices = resolve_model_settings(
+            provider,
+            model,
+            preferences.settings.for_model(provider_name, model),
+            preferences.overrides,
+            strict=True,
+            # OpenAI's defaults come from a built-in table; for Ollama the
+            # provider's own default avoids an extra /api/show request.
+            include_default=provider_name == "openai",
+        )
+        for note in [*warnings, *notices]:
+            print(f"{PROG_NAME}: note: {note}", file=stderr)
         if provider_name == "openai":
+            extra = {"instructions": instructions} if instructions else {}
             result = openai_provider.generate_text(
                 prompt=args.prompt,
-                model=args.model or openai_provider.DEFAULT_MODEL,
-                reasoning_effort=args.reasoning_effort,
-                max_output_tokens=args.max_output_tokens,
+                model=model,
+                reasoning_effort=resolved.reasoning,
+                max_output_tokens=resolved.max_output_tokens,
+                **extra,
             )
         else:
-            provider = create_providers()[provider_name]
             options = GenerationOptions(
-                model=args.model or provider.default_model(),
-                reasoning_effort=args.reasoning_effort,
-                max_output_tokens=args.max_output_tokens,
+                model=model,
+                reasoning_effort=resolved.reasoning,
+                max_output_tokens=resolved.max_output_tokens,
+                instructions=instructions,
+                reasoning_explicit=resolved.reasoning_explicit,
             )
             result = provider.generate([Message("user", args.prompt)], options)
+    except SettingsError as error:
+        return report_settings_error(error, stderr)
     except ProviderError as error:
         return report(error, stderr)
 
@@ -161,6 +218,11 @@ def run_prompt(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
 def run_interactive(args: argparse.Namespace) -> int:
     """Start an interactive chat session with the configured model."""
     session = open_session(args)
+    if session.provider is not None and session.provider not in PROVIDERS:
+        # e.g. a hand-edited active.json: start fresh with the defaults
+        warnings = session.startup_warnings
+        session = ChatSession(session.store, provider=args.provider, model=args.model)
+        session.startup_warnings = warnings
     provider_name = args.provider or session.provider or DEFAULT_PROVIDER
     providers = create_providers()
     try:
@@ -172,26 +234,37 @@ def run_interactive(args: argparse.Namespace) -> int:
         return report(error, sys.stderr)
     session.provider, session.model = provider_name, model
 
-    engine = ChatEngine(
-        providers, provider_name, model, args.reasoning_effort, args.max_output_tokens
-    )
-    settings = chat.ChatSettings(
-        provider=provider_name,
-        model=model,
-        show_usage=args.usage,
-        reasoning_effort=args.reasoning_effort,
-        max_output_tokens=args.max_output_tokens,
-    )
+    engine = ChatEngine(providers, provider_name, model)
+    preferences, warnings = load_preferences(args)
+    try:
+        notices = preferences.apply(engine, strict=True)
+    except SettingsError as error:
+        return report_settings_error(error, sys.stderr)
+    session.startup_warnings.extend([*warnings, *notices])
+    settings = display_settings(engine, args.usage)
     if not args.plain and is_fullscreen_terminal():
         tui = load_tui()
         if tui is not None:
-            exit_code = tui.run_tui(settings, engine.reply, session, engine=engine)
+            exit_code = tui.run_tui(
+                settings, engine.reply, session, engine=engine, preferences=preferences
+            )
             # curses has restored the terminal by now, so this is normal output.
             if args.transcript_on_exit and session.messages:
                 print(format_transcript(session.messages))
             return exit_code
     chat.enable_line_editing()
     return chat.run_chat(settings, engine.reply, input_fn=input, session=session)
+
+
+def display_settings(engine: ChatEngine, show_usage: bool) -> chat.ChatSettings:
+    return chat.ChatSettings(
+        provider=engine.provider,
+        model=engine.model,
+        show_usage=show_usage,
+        reasoning_effort=engine.reasoning_effort,
+        max_output_tokens=engine.max_output_tokens,
+        answer_style=engine.answer_style,
+    )
 
 
 def open_session(args: argparse.Namespace) -> ChatSession:

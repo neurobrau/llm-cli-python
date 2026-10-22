@@ -16,5 +16,6 @@ def isolated_state_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path
     """Point history storage at a temporary directory, never the real home."""
     state_home = tmp_path / "state"
     monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     return state_home

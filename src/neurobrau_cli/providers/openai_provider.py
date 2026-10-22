@@ -6,6 +6,7 @@ items and tool calls) is not implemented yet.
 """
 
 import os
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -20,6 +21,7 @@ from neurobrau_cli.providers.base import (
     GenerationResult,
     ModelInfo,
     ProviderError,
+    ReasoningSupport,
     TokenUsage,
 )
 
@@ -49,6 +51,47 @@ NON_TEXT_MODEL_MARKERS = (
 )
 
 
+# Confirmed capabilities: (reasoning efforts, max output tokens). The Models
+# API does not report these, so only models listed here get reasoning
+# choices; others show "Default (support unknown)". An empty effort tuple
+# means the model is known not to accept the reasoning parameter. Dated
+# snapshots ("gpt-5-2025-08-07") share their base model's entry.
+KNOWN_MODELS: dict[str, tuple[tuple[str, ...], int | None]] = {
+    # The project's default model; "none" is its specified default effort.
+    # Other efforts are not confirmed yet.
+    "gpt-6-luna": (("none",), None),
+    "gpt-5.2": (("none", "low", "medium", "high", "xhigh"), 128_000),
+    "gpt-5.1": (("none", "low", "medium", "high"), 128_000),
+    "gpt-5": (("minimal", "low", "medium", "high"), 128_000),
+    "gpt-5-mini": (("minimal", "low", "medium", "high"), 128_000),
+    "gpt-5-nano": (("minimal", "low", "medium", "high"), 128_000),
+    "o3": (("low", "medium", "high"), 100_000),
+    "o3-mini": (("low", "medium", "high"), 100_000),
+    "o4-mini": (("low", "medium", "high"), 100_000),
+    "gpt-4.1": ((), 32_768),
+    "gpt-4.1-mini": ((), 32_768),
+    "gpt-4.1-nano": ((), 32_768),
+    "gpt-4o": ((), 16_384),
+    "gpt-4o-mini": ((), 16_384),
+}
+SNAPSHOT_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
+
+
+def known_model(model: str) -> tuple[tuple[str, ...], int | None] | None:
+    return KNOWN_MODELS.get(model) or KNOWN_MODELS.get(SNAPSHOT_SUFFIX.sub("", model))
+
+
+def reasoning_support_for(model: str) -> ReasoningSupport:
+    """Efforts from KNOWN_MODELS; unknown models get no confirmed values."""
+    entry = known_model(model)
+    if entry is None:
+        return ReasoningSupport(known=False)
+    efforts = entry[0]
+    return ReasoningSupport(
+        values=efforts, known=True, default="none" if "none" in efforts else None
+    )
+
+
 class OpenAIProviderError(ProviderError):
     """A user-facing, credential-free error raised by the OpenAI provider."""
 
@@ -74,13 +117,17 @@ def build_request(
     model: str,
     reasoning_effort: str | None,
     max_output_tokens: int | None,
+    instructions: str | None = None,
 ) -> dict[str, Any]:
     """Build keyword arguments for `client.responses.create`.
 
     `reasoning_effort=None` omits the reasoning parameter entirely, for models
-    that reject it.
+    that reject it. `instructions` is the Responses API system/developer
+    message; it applies to this request only and is not part of `input`.
     """
     request: dict[str, Any] = {"model": model, "input": input_}
+    if instructions is not None:
+        request["instructions"] = instructions
     if reasoning_effort is not None:
         request["reasoning"] = {"effort": reasoning_effort}
     request["store"] = False
@@ -100,9 +147,10 @@ def generate_text(
     reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
     max_output_tokens: int | None = None,
     client: OpenAI | None = None,
+    instructions: str | None = None,
 ) -> GenerationResult:
     """Send a one-shot prompt to the Responses API and return its text output."""
-    request = build_request(prompt, model, reasoning_effort, max_output_tokens)
+    request = build_request(prompt, model, reasoning_effort, max_output_tokens, instructions)
     return send_request(request, client)
 
 
@@ -112,10 +160,11 @@ def generate_reply(
     reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
     max_output_tokens: int | None = None,
     client: OpenAI | None = None,
+    instructions: str | None = None,
 ) -> GenerationResult:
     """Send a conversation, oldest message first, and return the model's reply."""
     request = build_request(
-        to_input_items(messages), model, reasoning_effort, max_output_tokens
+        to_input_items(messages), model, reasoning_effort, max_output_tokens, instructions
     )
     return send_request(request, client)
 
@@ -200,27 +249,49 @@ class OpenAIProvider:
         return self._client
 
     def generate(self, messages: Sequence[Message], options: GenerationOptions) -> GenerationResult:
-        effort = None if options.model in self._no_reasoning else options.reasoning_effort
+        effort = options.reasoning_effort
+        if effort is not None and not options.reasoning_explicit and options.model in self._no_reasoning:
+            effort = None
         try:
             return self._generate(messages, options, effort)
         except OpenAIProviderError as error:
-            # Not every model supports reasoning. Retry once without it and
-            # remember the model, instead of failing every message.
             if effort is None or not rejects_reasoning(error):
                 raise
+            if options.reasoning_explicit:
+                # Never silently drop a value the user chose.
+                raise OpenAIProviderError(
+                    f"{options.model} does not accept reasoning effort '{effort}' "
+                    f"({error}). Choose another value with F4 or --reasoning-effort."
+                ) from error
+        # A built-in default the model rejects: retry once without it and
+        # remember the model, instead of failing every message.
         self._no_reasoning.add(options.model)
         return self._generate(messages, options, None)
 
     def _generate(
         self, messages: Sequence[Message], options: GenerationOptions, effort: str | None
     ) -> GenerationResult:
+        kwargs: dict[str, Any] = {}
+        if options.instructions is not None:
+            kwargs["instructions"] = options.instructions
         return generate_reply(
             list(messages),
             model=options.model,
             reasoning_effort=effort,
             max_output_tokens=options.max_output_tokens,
             client=self.client(),
+            **kwargs,
         )
+
+    def reasoning_support(self, model: str) -> ReasoningSupport:
+        """From KNOWN_MODELS only; no request. A rejection seen this session wins."""
+        if model in self._no_reasoning:
+            return ReasoningSupport(known=True)
+        return reasoning_support_for(model)
+
+    def max_output_limit(self, model: str) -> int | None:
+        entry = known_model(model)
+        return entry[1] if entry else None
 
     def list_models(self, refresh: bool = False) -> list[ModelInfo]:
         """Text-capable model IDs from the Models API, sorted. One bounded request."""

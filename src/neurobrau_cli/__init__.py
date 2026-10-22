@@ -1,3 +1,4 @@
 """NeuroBräu CLI — educational multi-provider LLM command-line client."""
 
-__version__ = "0.1.0"
+# The only place the version is defined; pyproject.toml reads it at build time.
+__version__ = "0.2.0"

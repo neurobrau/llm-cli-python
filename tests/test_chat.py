@@ -6,6 +6,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from neurobrau_cli import __version__
+
 from neurobrau_cli import chat
 from neurobrau_cli.chat import ChatSettings, parse_command, run_chat
 from neurobrau_cli.conversation import Message
@@ -68,7 +70,7 @@ def test_startup_banner_shows_name_version_provider_model_and_hint(
 
     out = capsys.readouterr().out
     assert exit_code == 0
-    assert "NeuroBräu CLI 0.1.0" in out
+    assert f"NeuroBräu CLI {__version__}" in out
     assert "Provider: openai | Model: gpt-test" in out
     assert "/help" in out
     assert model.calls == []

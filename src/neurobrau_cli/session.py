@@ -5,6 +5,7 @@ persistence. UIs call these methods; they never touch the filesystem directly.
 """
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 
 from neurobrau_cli.conversation import Conversation, Message
@@ -23,6 +24,31 @@ Clock = Callable[[], datetime]
 # Files written before provider selection existed have no provider/model;
 # they were all OpenAI conversations.
 LEGACY_PROVIDER = "openai"
+
+Selection = tuple[str | None, str | None]
+
+
+@dataclass
+class Parked:
+    """A conversation set aside while another provider/model is in use."""
+
+    id: str
+    created_at: datetime
+    updated_at: datetime
+    conversation: Conversation
+    on_disk: bool
+
+
+def matcher(provider: str | None, model: str | None) -> Callable[[StoredConversation], bool]:
+    """Conversations held with `provider`/`model` (None: any). Legacy files are OpenAI, any model."""
+
+    def matches(stored: StoredConversation) -> bool:
+        stored_provider = stored.provider or LEGACY_PROVIDER
+        return (provider is None or stored_provider == provider) and (
+            model is None or stored.model in (None, model)
+        )
+
+    return matches
 
 
 def exchange(conversation: Conversation, text: str, reply_fn: ReplyFn) -> GenerationResult:
@@ -56,15 +82,12 @@ class ChatSession:
         self.restored = stored is not None and bool(stored.messages)
         self.provider = provider
         self.model = model
+        self._parked: dict[Selection, Parked] = {}
+        self._active_saved: Selection | None = None  # last selection written to active.json
         if stored is None:
             self._start_new()
         else:
-            self.id = stored.id
-            self.created_at = stored.created_at
-            self.updated_at = stored.updated_at
-            self.conversation = Conversation(stored.messages)
-            self.provider = stored.provider or LEGACY_PROVIDER
-            self.model = stored.model
+            self._adopt(stored)
 
     @classmethod
     def restore(
@@ -83,14 +106,17 @@ class ChatSession:
         if store is None:
             return cls(clock=clock, provider=provider, model=model)
 
-        def matches(stored: StoredConversation) -> bool:
-            stored_provider = stored.provider or LEGACY_PROVIDER
-            return (provider is None or stored_provider == provider) and (
-                model is None or stored.model in (None, model)
-            )
-
-        latest, warnings = store.load_latest(matches)
+        warnings: list[str] = []
+        if provider is None and model is None:
+            # Continue with whatever was active last time (see active.json).
+            active, warning = store.load_active()
+            if warning:
+                warnings.append(warning)
+            if active:
+                provider, model = active
+        latest, load_warnings = store.load_latest(matcher(provider, model))
         session = cls(store, latest, clock, provider, model)
+        warnings.extend(load_warnings)
         session.provider = provider or session.provider
         session.model = model or session.model
         session.startup_warnings = warnings
@@ -127,16 +153,39 @@ class ChatSession:
     def switch(self, provider: str, model: str) -> str | None:
         """Use another provider or model. Return a save warning, if any.
 
-        A non-empty conversation is kept on disk and a new one is started. The
-        (possibly empty) conversation is saved so the new selection is the one
-        restored on the next launch.
+        Each provider/model keeps its own conversation: the current one is set
+        aside (it is already saved), and the target's most recent conversation
+        comes back, from this run or from disk. History never moves between
+        selections. Without a previous conversation, a new empty one is started
+        and saved so the selection is restored on the next launch. Restoring
+        does not rewrite the restored file; `active.json` records the selection.
         """
         if (provider, model) == (self.provider, self.model):
             return None
         if self.messages:
-            self._start_new()
+            self._parked[(self.provider, self.model)] = Parked(
+                self.id, self.created_at, self.updated_at, self.conversation, self._on_disk
+            )
+        parked = self._parked.pop((provider, model), None)
+        stored = None
+        if parked is None and self.store is not None:
+            stored, _ = self.store.load_latest(matcher(provider, model))
+        if parked is not None:
+            self.id, self.created_at, self.updated_at = parked.id, parked.created_at, parked.updated_at
+            self.conversation, self._on_disk = parked.conversation, parked.on_disk
+        elif stored is not None:
+            self._adopt(stored)
+        else:
+            # An empty conversation that is not on disk yet can be reused;
+            # anything else (e.g. the empty one /reset saved) stays with its selection.
+            if self.messages or self._on_disk:
+                self._start_new()
+            self.restored = False
+            self.provider, self.model = provider, model
+            return self.save()
+        self.restored = bool(self.messages)
         self.provider, self.model = provider, model
-        return self.save()
+        return self.save_active()
 
     def saved_count(self) -> int:
         """Number of conversation files on disk. Raises HistoryError."""
@@ -147,6 +196,7 @@ class ChatSession:
         if self.store is None:
             return 0
         deleted = self.store.delete_all()
+        self._parked.clear()  # conversations set aside in this run are deleted too
         self._start_new()
         return deleted
 
@@ -159,6 +209,19 @@ class ChatSession:
             self.store.save(self.to_stored())
         except HistoryError as error:
             return str(error)
+        self._on_disk = True
+        return self.save_active()
+
+    def save_active(self) -> str | None:
+        """Record the current provider/model as active (only when it changed)."""
+        selection = (self.provider, self.model)
+        if self.store is None or None in selection or selection == self._active_saved:
+            return None
+        try:
+            self.store.save_active(self.provider, self.model)  # type: ignore[arg-type]
+        except HistoryError as error:
+            return str(error)
+        self._active_saved = selection
         return None
 
     def to_stored(self) -> StoredConversation:
@@ -170,3 +233,13 @@ class ChatSession:
         self.id = new_conversation_id()
         self.created_at = self.updated_at = self.clock()
         self.conversation = Conversation()
+        self._on_disk = False
+
+    def _adopt(self, stored: StoredConversation) -> None:
+        self.id = stored.id
+        self.created_at = stored.created_at
+        self.updated_at = stored.updated_at
+        self.conversation = Conversation(stored.messages)
+        self.provider = stored.provider or LEGACY_PROVIDER
+        self.model = stored.model or self.model
+        self._on_disk = True
