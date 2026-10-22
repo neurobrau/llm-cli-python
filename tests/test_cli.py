@@ -714,12 +714,12 @@ def test_token_limit_over_known_maximum_is_a_usage_error(
 def test_unsupported_saved_setting_falls_back_with_visible_note(
     fake_generate: MagicMock, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    write_settings(tmp_path, {"providers": {"openai": {"models": {"gpt-6-luna": {"reasoning": "max"}}}}})
+    write_settings(tmp_path, {"providers": {"openai": {"models": {"gpt-6-luna": {"reasoning": "minimal"}}}}})
 
     assert main(["Hi"]) == 0
 
     assert fake_generate.call_args.kwargs["reasoning_effort"] == "none"
-    assert "note: Saved reasoning 'Max' is not available for gpt-6-luna" in capsys.readouterr().err
+    assert "note: Saved reasoning 'Minimal' is not available for gpt-6-luna" in capsys.readouterr().err
 
 
 def test_corrupt_settings_do_not_break_one_shot(

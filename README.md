@@ -64,6 +64,26 @@ Generation settings change from the next message on and keep the conversation:
 
 Ollama thinking output is kept out of the answer.
 
+## Token usage and estimated cost
+
+Each API request's usage is stored with its conversation exactly as the
+provider reports it: input, cached input, cache writes, output, reasoning
+and total tokens (nothing is estimated from text). The LLM SETTINGS panel
+shows the conversation totals, the input size of the latest request
+(`context`), and an **ESTIMATED** cost; `/usage` prints the full breakdown.
+Totals survive restarts. Because every request re-sends the whole history,
+billed input grows faster than the conversation itself.
+
+Costs are estimates, never billed amounts, calculated with `Decimal` from a
+small versioned catalog of official OpenAI prices (`src/neurobrau_cli/pricing.py`,
+version 2026-10-22; currently gpt-6-luna and gpt-5.1). Cached input, cache
+writes, long prompts (> 272K input tokens) and processing tiers (Flex,
+Batch, Fast) are priced when the API reports them. When the model, tier or
+required counts are unknown, the estimate is shown as qualified (`~`), a
+lower bound (`>=`) or `unavailable`, never invented. Local Ollama models
+cost `$0`; Ollama cloud models are never shown as free. Details:
+[docs/tui-spec.md](docs/tui-spec.md#15-token-accounting-and-estimated-cost).
+
 ## Settings
 
 F4–F6 choices are saved in `$XDG_CONFIG_HOME/neurobrau/settings.json`
@@ -97,6 +117,7 @@ Chat commands (backslash aliases such as `\help` also work):
 | `/help` | list commands and keys |
 | `/reset` | start a new conversation; the previous one stays saved on disk |
 | `/cleanup` | delete **all** saved conversations after you type `yes` to confirm |
+| `/usage` | token usage and ESTIMATED cost of this conversation |
 | `/exit` | exit; the conversation stays saved |
 
 Ctrl+D (on empty input) or Ctrl+C while idle exits; Ctrl+C while waiting for
@@ -153,6 +174,14 @@ already in your scrollback). The transcript includes restored messages.
 
 - OpenAI's model list hides obvious non-text models by name; other listed
   models may still be rejected by the Responses API (shown as an error).
+- The pricing catalog only covers models whose prices were verified on
+  OpenAI's official pages; prices change, so `PRICING_VERSION` must be
+  updated with them. Cancelled requests may still be billed by the provider
+  but report no usage, so they are not counted. Data-residency uplifts and
+  non-default cache retention are not modelled.
+- gpt-6-luna supports none, low, medium, high, xhigh and max; its documented
+  default is medium, but without a saved or CLI choice this app still sends
+  `none` (the project default since Task 002).
 - OpenAI reasoning choices come from a small built-in table
   (`KNOWN_MODELS` in `providers/openai_provider.py`); other models offer
   only Default in F4. A model that rejects a built-in default is retried

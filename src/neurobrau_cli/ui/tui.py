@@ -30,6 +30,7 @@ from neurobrau_cli.chat import (
     prepare_cleanup,
     reset_notice,
     restored_notice,
+    usage_report,
 )
 from neurobrau_cli.engine import ChatEngine
 from neurobrau_cli.preferences import Preferences, check_max_tokens, label
@@ -45,7 +46,9 @@ from neurobrau_cli.providers.base import (
     TokenUsage,
 )
 from neurobrau_cli.session import ChatSession, StreamFn
+from neurobrau_cli.pricing import CostEstimate, format_cost_short, total_cost
 from neurobrau_cli.settings import ANSWER_STYLES, TOKEN_PRESETS
+from neurobrau_cli.usage import total_usage
 from neurobrau_cli.ui import status as rt
 from neurobrau_cli.ui.menu import ESCAPE, Menu, MenuItem
 from neurobrau_cli.ui.status import RuntimeStatus
@@ -77,8 +80,9 @@ HELP_TEXT = """Commands:
   /help     show this help
   /reset    start a new conversation (the previous one stays saved)
   /cleanup  delete all saved conversations (asks for confirmation)
+  /usage    token usage and ESTIMATED cost of this conversation
   /exit     exit the application (the conversation stays saved)
-Backslash aliases also work: \\help, \\reset, \\cleanup, \\exit.
+Backslash aliases also work: \\help, \\reset, \\cleanup, \\usage, \\exit.
 Keys: Enter send, Backspace/Delete edit, Left/Right/Home/End move,
 Ctrl+U clear input, PgUp/PgDn/Up/Down scroll, Ctrl+D (empty input) or Ctrl+C quit.
 F2 model, F3 provider (both start a new conversation).
@@ -247,23 +251,6 @@ def visible_window(total: int, height: int, scroll: int) -> tuple[int, int]:
     """Return the [start, end) line range shown when scrolled `scroll` lines up."""
     end = total - scroll
     return max(0, end - height), end
-
-
-def add_usage(total: TokenUsage | None, usage: TokenUsage | None) -> TokenUsage | None:
-    """Session totals: sum each reported count; a count never reported stays None."""
-    if usage is None:
-        return total
-    if total is None:
-        return usage
-
-    def plus(a: int | None, b: int | None) -> int | None:
-        return b if a is None else a if b is None else a + b
-
-    return TokenUsage(
-        plus(total.input_tokens, usage.input_tokens),
-        plus(total.output_tokens, usage.output_tokens),
-        plus(total.total_tokens, usage.total_tokens),
-    )
 
 
 @dataclass
@@ -502,6 +489,8 @@ class TuiApp:
                 self.exit_code = EXIT_OK
             case "help":
                 self.add_entry("info", HELP_TEXT)
+            case "usage":
+                self.add_entry("info", usage_report(self.session))
             case "reset":
                 warning = self.session.reset()
                 self.clear_panel(reset_notice(self.session))
@@ -539,7 +528,6 @@ class TuiApp:
             self.state.status = RuntimeStatus(rt.CANCELLED)
         else:
             self.add_entry("ai", result.text)
-            self.state.usage = add_usage(self.state.usage, result.usage)
             self.finish_status({}, result.usage, self.clock() - started, None, save_warning)
         finally:
             self.state.waiting = False
@@ -568,9 +556,9 @@ class TuiApp:
         if command == "exit":
             self.cancel_request()
             self.exit_code = EXIT_OK
-        elif command == "help":
+        elif command in ("help", "usage"):
             self.state.input_text, self.state.cursor = "", 0
-            self.add_entry("info", HELP_TEXT)
+            self.add_entry("info", HELP_TEXT if command == "help" else usage_report(self.session))
         elif text:
             self.flash(RuntimeStatus(rt.WARNING, ("A response is being generated; wait or press Ctrl+C",)))
 
@@ -606,13 +594,15 @@ class TuiApp:
             self.request = None
             request.text = event.result.text
             self.show_partial(request)
-            save_warning = self.session.complete_exchange(request.user_text, request.text)
-            self.state.usage = add_usage(self.state.usage, event.result.usage)
+            save_warning = self.session.complete_exchange(
+                request.user_text, request.text, event.result
+            )
             first = None if request.first_text is None else request.first_text - request.started
             self.finish_status(event.metadata, event.result.usage,
                                self.clock() - request.started, first, save_warning)
         elif isinstance(event, StreamIncomplete):
             self.request = None
+            self.session.record_incomplete(event.usage)  # billed even though not saved as a message
             self.add_entry("error", f"Incomplete: {event.reason}.{self.not_saved(request)}")
             self.state.status = RuntimeStatus(rt.WARNING, (f"Response incomplete: {event.reason}",))
         elif isinstance(event, StreamFailed):
@@ -750,7 +740,9 @@ class TuiApp:
             self.add_entry("info", f"{engine.model} does not support reasoning.")
             return
         else:
-            items = [MenuItem("Default", "", "model default")] if support.allows_default else []
+            note = (f"model default: {support.model_default}" if support.model_default
+                    else "model default")
+            items = [MenuItem("Default", "", note)] if support.allows_default else []
             items += [MenuItem(label(value), value) for value in support.values]
             current = engine.reasoning_effort or ""
             items = [replace(item, current=item.value == current) for item in items]
@@ -1043,7 +1035,11 @@ class TuiApp:
         if layout.panel_x is None:
             return
         x = layout.panel_x + 2
-        rows = settings_panel_lines(self.settings, self.state.usage)
+        records = self.session.requests
+        context = next(
+            (r.usage.input_tokens for r in reversed(records) if r.status == "completed"), None
+        )
+        rows = settings_panel_lines(self.settings, total_usage(records), total_cost(records), context)
         for offset, (text, style) in enumerate(rows[: layout.conversation_height]):
             attr = getattr(self.styles, style)
             self.put(layout.conversation_top + offset, x, text, attr, layout.cols - 2)
@@ -1152,9 +1148,29 @@ def fit(text: str, width: int) -> str:
 PANEL_CONTENT_WIDTH = PANEL_WIDTH - 4
 
 
-def settings_panel_lines(settings: ChatSettings, usage: TokenUsage | None) -> list[tuple[str, str]]:
-    """(text, style) rows of the LLM SETTINGS panel."""
+def compact(count: int | None) -> str:
+    """Token count for the narrow panel: 9999, 12.3k, 4.56M (only used when needed)."""
+    if count is None:
+        return "?"
+    for limit, suffix in ((1_000_000_000, "G"), (1_000_000, "M"), (1_000, "k")):
+        if count >= limit and count >= 10_000:
+            value = count / limit
+            return f"{value:.3g}{suffix}"
+    return str(count)
+
+
+def settings_panel_lines(
+    settings: ChatSettings,
+    usage: TokenUsage | None,
+    cost: CostEstimate | None = None,
+    context: int | None = None,
+) -> list[tuple[str, str]]:
+    """(text, style) rows of the LLM SETTINGS panel. Token values are conversation totals."""
     width = PANEL_CONTENT_WIDTH
+
+    def counts(text: str, compact_text: str) -> tuple[str, str]:
+        """Exact numbers when they fit, abbreviated otherwise."""
+        return value(text if len(text) + 1 <= width else compact_text)
 
     def value(text: str) -> tuple[str, str]:
         return fit(f" {text}", width), "text"
@@ -1171,9 +1187,20 @@ def settings_panel_lines(settings: ChatSettings, usage: TokenUsage | None) -> li
     if usage is None:
         rows.append(value("-"))
     else:
-        counts = [usage.input_tokens, usage.output_tokens, usage.total_tokens]
-        shown = ["?" if count is None else str(count) for count in counts]
-        rows += [value(f"in {shown[0]} out {shown[1]}"), value(f"total {shown[2]}")]
+        exact = ["?" if n is None else str(n) for n in (usage.input_tokens, usage.output_tokens,
+                                                       usage.total_tokens)]
+        rows += [
+            counts(f"in {exact[0]} out {exact[1]}",
+                   f"in {compact(usage.input_tokens)} out {compact(usage.output_tokens)}"),
+            counts(f"total {exact[2]}", f"total {compact(usage.total_tokens)}"),
+        ]
+        if usage.cached_input_tokens:
+            rows.append(value(f"cached {compact(usage.cached_input_tokens)}"))
+        if usage.reasoning_tokens:
+            rows.append(value(f"reasoning {compact(usage.reasoning_tokens)}"))
+    if context is not None:
+        rows.append(value(f"context {compact(context)}"))
+    rows += [("COST (EST.)", "border"), value(format_cost_short(cost))]
     return rows
 
 

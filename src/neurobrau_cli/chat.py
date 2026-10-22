@@ -7,6 +7,8 @@ from typing import TextIO
 
 from neurobrau_cli import __version__
 from neurobrau_cli.formatting import format_stream_stats, format_usage
+from neurobrau_cli.pricing import describe_cost, total_cost, usage_breakdown
+from neurobrau_cli.usage import total_usage
 from neurobrau_cli.providers.base import (
     ProviderError,
     ReasoningDelta,
@@ -29,8 +31,9 @@ HELP_TEXT = """Commands:
   /help     show this help
   /reset    start a new conversation (the previous one stays saved)
   /cleanup  delete all saved conversations (asks for confirmation)
+  /usage    token usage and ESTIMATED cost of this conversation
   /exit     exit the chat (the conversation stays saved)
-Backslash aliases also work: \\help, \\reset, \\cleanup, \\exit.
+Backslash aliases also work: \\help, \\reset, \\cleanup, \\usage, \\exit.
 Press Ctrl+D (EOF) or Ctrl+C at the prompt to exit."""
 CLEANUP_CONFIRMATION = "yes"
 
@@ -78,6 +81,26 @@ def restored_notice(session: ChatSession) -> str | None:
         f"Restored conversation from {updated} ({len(session.messages)} messages). "
         "Type /reset to start a new one."
     )
+
+
+def usage_report(session: ChatSession) -> str:
+    """Conversation usage as reported by the API, with the ESTIMATED cost."""
+    records = session.requests
+    if not records:
+        return "Token usage: no API requests in this conversation yet."
+    incomplete = sum(1 for r in records if r.status == "incomplete")
+    lines = [f"Conversation usage ({len(records)} request(s), as reported by the API):"]
+    lines += usage_breakdown(total_usage(records))
+    latest = next((r for r in reversed(records) if r.status == "completed"), None)
+    if latest is not None and latest.usage.input_tokens is not None:
+        lines.append(
+            f"Latest request input: {latest.usage.input_tokens:,} tokens "
+            "(the whole history is sent, and billed, with every request)"
+        )
+    if incomplete:
+        lines.append(f"Includes {incomplete} incomplete answer(s): billed, but not saved as messages.")
+    lines.append(describe_cost(total_cost(records)))
+    return "\n".join(lines)
 
 
 def reset_notice(session: ChatSession) -> str:
@@ -139,6 +162,8 @@ def handle_command(
                 print(f"warning: {warning}", file=stderr)
         case "cleanup":
             run_cleanup(session, input_fn, stdout, stderr)
+        case "usage":
+            print(usage_report(session), file=stdout)
         case _:
             print(f"Unknown command: /{command}. Type /help for commands.", file=stdout)
     return True

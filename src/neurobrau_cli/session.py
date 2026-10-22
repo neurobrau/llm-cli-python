@@ -16,9 +16,12 @@ from neurobrau_cli.providers.base import (
     StreamCompleted,
     StreamEvent,
     StreamFailed,
+    StreamIncomplete,
     TerminalEvent,
     TextDelta,
+    TokenUsage,
 )
+from neurobrau_cli.usage import UsageRecord
 from neurobrau_cli.storage import (
     HistoryError,
     HistoryStore,
@@ -48,6 +51,7 @@ class Parked:
     updated_at: datetime
     conversation: Conversation
     on_disk: bool
+    requests: list[UsageRecord]
 
 
 def matcher(provider: str | None, model: str | None) -> Callable[[StoredConversation], bool]:
@@ -174,7 +178,24 @@ class ChatSession:
         A failed save keeps the exchange in memory and is reported, not raised.
         """
         result = exchange(self.conversation, text, reply_fn)
+        self.record_usage(result)
         return result, self.save()
+
+    def record_usage(self, result: GenerationResult, status: str = "completed") -> None:
+        """Keep the provider-reported usage of one request (once; nothing is estimated)."""
+        if result.usage is None:
+            return
+        self.requests.append(UsageRecord(
+            self.clock(), self.provider or "unknown", self.model or "unknown",
+            result.usage, result.service_tier, status,
+        ))
+
+    def record_incomplete(self, usage: TokenUsage | None) -> str | None:
+        """Usage of an answer cut off early: billed, but not part of the conversation."""
+        if usage is None:
+            return None
+        self.record_usage(GenerationResult("", usage), status="incomplete")
+        return self.save() if self.messages or self._on_disk else None
 
     def send_stream(
         self, text: str, stream_fn: StreamFn, on_delta: DeltaHandler
@@ -184,12 +205,20 @@ class ChatSession:
         Only a completed answer is committed and saved.
         """
         terminal = stream_exchange(self.conversation, text, stream_fn, on_delta)
-        warning = self.save() if isinstance(terminal, StreamCompleted) else None
-        return terminal, warning
+        if isinstance(terminal, StreamCompleted):
+            self.record_usage(terminal.result)
+            return terminal, self.save()
+        if isinstance(terminal, StreamIncomplete):
+            return terminal, self.record_incomplete(terminal.usage)
+        return terminal, None
 
-    def complete_exchange(self, text: str, answer: str) -> str | None:
+    def complete_exchange(
+        self, text: str, answer: str, result: GenerationResult | None = None
+    ) -> str | None:
         """Commit a finished user/assistant pair (e.g. assembled from a stream) and save it."""
         self.conversation.commit_exchange(text, answer)
+        if result is not None:
+            self.record_usage(result)
         return self.save()
 
     def reset(self) -> str | None:
@@ -215,9 +244,10 @@ class ChatSession:
         """
         if (provider, model) == (self.provider, self.model):
             return None
-        if self.messages:
+        if self.messages or self.requests:
             self._parked[(self.provider, self.model)] = Parked(
-                self.id, self.created_at, self.updated_at, self.conversation, self._on_disk
+                self.id, self.created_at, self.updated_at, self.conversation, self._on_disk,
+                self.requests,
             )
         parked = self._parked.pop((provider, model), None)
         stored = None
@@ -226,6 +256,7 @@ class ChatSession:
         if parked is not None:
             self.id, self.created_at, self.updated_at = parked.id, parked.created_at, parked.updated_at
             self.conversation, self._on_disk = parked.conversation, parked.on_disk
+            self.requests = parked.requests
         elif stored is not None:
             self._adopt(stored)
         else:
@@ -279,13 +310,15 @@ class ChatSession:
 
     def to_stored(self) -> StoredConversation:
         return StoredConversation(
-            self.id, self.created_at, self.updated_at, self.messages, self.provider, self.model
+            self.id, self.created_at, self.updated_at, self.messages, self.provider, self.model,
+            tuple(self.requests),
         )
 
     def _start_new(self) -> None:
         self.id = new_conversation_id()
         self.created_at = self.updated_at = self.clock()
         self.conversation = Conversation()
+        self.requests: list[UsageRecord] = []
         self._on_disk = False
 
     def _adopt(self, stored: StoredConversation) -> None:
@@ -293,6 +326,7 @@ class ChatSession:
         self.created_at = stored.created_at
         self.updated_at = stored.updated_at
         self.conversation = Conversation(stored.messages)
+        self.requests = list(stored.requests)
         self.provider = stored.provider or LEGACY_PROVIDER
         self.model = stored.model or self.model
         self._on_disk = True

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from neurobrau_cli.conversation import Message
+from neurobrau_cli.usage import UsageRecord, record_from_json, record_to_json
 
 SCHEMA_VERSION = 1
 APP_DIR_NAME = "neurobrau"
@@ -39,6 +40,7 @@ class StoredConversation:
     messages: tuple[Message, ...] = ()
     provider: str | None = None  # optional; absent in files written before Task 006
     model: str | None = None
+    requests: tuple[UsageRecord, ...] = ()  # optional; absent in files written before Task 009
 
 
 def utc_now() -> datetime:
@@ -94,6 +96,8 @@ def to_json(conversation: StoredConversation) -> dict[str, Any]:
     data["messages"] = [
         {"role": message.role, "content": message.content} for message in conversation.messages
     ]
+    if conversation.requests:
+        data["requests"] = [record_to_json(r, format_timestamp) for r in conversation.requests]
     return data
 
 
@@ -130,7 +134,16 @@ def from_json(data: object) -> StoredConversation:
         messages=tuple(messages),
         provider=optional_string(data, "provider"),
         model=optional_string(data, "model"),
+        requests=parse_requests(data.get("requests")),
     )
+
+
+def parse_requests(value: object) -> tuple[UsageRecord, ...]:
+    """Usage records; malformed entries are skipped so the conversation still loads."""
+    if not isinstance(value, list):
+        return ()
+    records = (record_from_json(item, parse_timestamp) for item in value)
+    return tuple(record for record in records if record is not None)
 
 
 def optional_string(data: dict[str, Any], field: str) -> str | None:

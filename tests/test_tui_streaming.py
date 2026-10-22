@@ -560,3 +560,166 @@ def test_sigint_when_idle_still_exits() -> None:
     _, _, exit_code = run_script(stream, build)
 
     assert exit_code == EXIT_INTERRUPTED
+
+
+# ----- Task 009: usage and ESTIMATED cost in the settings panel -----
+
+from neurobrau_cli.ui.tui import compact, settings_panel_lines  # noqa: E402
+
+DETAILED = TokenUsage(1_000, 200, 1_200, cached_input_tokens=600, cache_write_tokens=100,
+                      reasoning_tokens=50)
+
+
+def panel(frame: list[str]) -> list[str]:
+    return [line[60:78].rstrip() for line in frame[1:19]]
+
+
+def make_priced_app(stream: GatedStream, provider: str = "openai", model: str = "gpt-6-luna",
+                    store: HistoryStore | None = None) -> tuple[TuiApp, FakeScreen]:
+    screen = FakeScreen(25, 80, [])
+    session = ChatSession.restore(store, provider=provider, model=model)
+    app = TuiApp(screen, ChatSettings(provider, model, reasoning_effort="none"), lambda m: None,
+                 STYLES, session, stream_fn=stream)
+    return app, screen
+
+
+def test_panel_shows_conversation_usage_details_and_estimated_cost() -> None:
+    result = GenerationResult("ok", DETAILED, service_tier="default")
+    stream = GatedStream([TextDelta("ok"), StreamCompleted(result)], open_gate=True)
+    app, screen = make_priced_app(stream)
+    screen.keys = [*typed("Hi"), idle(app)]
+
+    app.run()
+
+    assert panel(screen.snapshots[-1])[10:18] == [
+        "TOKENS", " in 1000 out 200", " total 1200", " cached 600", " reasoning 50",
+        " context 1000", "COST (EST.)", " $0.000149",
+    ]
+    status = status_line(screen.snapshots[-1])
+    assert "$" not in status and "1200" not in status  # cost/tokens never in the runtime bar
+
+
+def test_panel_totals_accumulate_and_survive_restart(tmp_path: Path) -> None:
+    store = HistoryStore(tmp_path / "conversations")
+    result = GenerationResult("ok", TokenUsage(100, 10, 110), service_tier="default")
+    stream = GatedStream([StreamCompleted(result)], [StreamCompleted(result)], open_gate=True)
+    app, screen = make_priced_app(stream, store=store)
+    screen.keys = [*typed("One"), idle(app), *typed("Two"), idle(app)]
+    app.run()
+
+    restarted, screen2 = make_priced_app(GatedStream(), store=store)
+    restarted.render()
+
+    assert panel(screen2.snapshots[-1])[10:16] == [
+        "TOKENS", " in 200 out 20", " total 220", " context 100", "COST (EST.)",
+        " ~$0.000030",  # cached tokens not reported: a qualified (upper-bound) estimate
+    ]
+
+
+def test_local_ollama_cost_is_zero() -> None:
+    stream = GatedStream([StreamCompleted(GenerationResult("ok", TokenUsage(30, 5, 35)), OLLAMA_METRICS)],
+                         open_gate=True)
+    app, screen = make_priced_app(stream, provider="ollama", model="qwen3.5:4b")
+    screen.keys = [*typed("Hi"), idle(app)]
+
+    app.run()
+
+    assert panel(screen.snapshots[-1])[13:16] == [" context 30", "COST (EST.)", " $0 (local)"]
+    assert status_line(screen.snapshots[-1]).startswith("DONE | 2.50s total")  # timing metrics stay
+
+
+def test_unknown_model_cost_is_unavailable_not_invented() -> None:
+    stream = GatedStream([StreamCompleted(GenerationResult("ok", TokenUsage(30, 5, 35)))], open_gate=True)
+    app, screen = make_priced_app(stream, model="my-fine-tune")
+    screen.keys = [*typed("Hi"), idle(app)]
+
+    app.run()
+
+    assert panel(screen.snapshots[-1])[13:16] == [" context 30", "COST (EST.)", " unavailable"]
+
+
+def test_incomplete_usage_counts_but_cancel_and_failure_do_not() -> None:
+    incomplete = StreamIncomplete("the max output token limit was reached", "Par", TokenUsage(50, 8, 58))
+    stream = GatedStream([TextDelta("Par"), incomplete],
+                         [StreamFailed(ProviderError("boom"))],
+                         [TextDelta("x"), StreamCompleted(GenerationResult("x", TokenUsage(9, 9, 18)))])
+
+    def build(app: TuiApp) -> list[object]:
+        return [*typed("One"), Do(lambda: stream.release(2)), idle(app),
+                *typed("Two"), Do(lambda: stream.release(1)), idle(app),
+                *typed("Three"), Do(lambda: stream.release(1)),
+                Wait(lambda: app.request is not None and app.request.text == "x"), "<CTRL-C>",
+                Do(lambda: stream.release(1)), Wait(lambda: stream.closed == 3)]
+
+    app, screen, _ = run_script(stream, build)
+
+    assert [(r.status, r.usage.input_tokens) for r in app.session.requests] == [("incomplete", 50)]
+    assert app.session.messages == ()
+    assert panel(screen.snapshots[-1])[11] == " in 50 out 8"
+
+
+def test_large_numbers_are_abbreviated_only_when_needed() -> None:
+    usage = TokenUsage(123_456_789, 9_876_543, 133_333_332, cached_input_tokens=100_000_000,
+                       reasoning_tokens=5_000_000)
+    rows = [text for text, _ in settings_panel_lines(ChatSettings("openai", "gpt-6-luna"), usage)]
+
+    # " in 123456789 out 9876543" would not fit: abbreviated; " total 133333332" fits: exact.
+    assert rows[11:15] == [" in 123M out 9.88M", " total 133333332", " cached 100M", " reasoning 5M"]
+    assert all(len(row) <= 18 for row in rows)
+    small = [t for t, _ in settings_panel_lines(ChatSettings("openai", "m"), TokenUsage(9999, 12, 10011))]
+    assert small[11:13] == [" in 9999 out 12", " total 10011"]
+    assert [compact(n) for n in (None, 9_999, 10_000, 12_345, 1_234_567, 2_000_000_000)] == [
+        "?", "9999", "10k", "12.3k", "1.23M", "2G"
+    ]
+
+
+def test_usage_panel_at_narrow_and_small_sizes() -> None:
+    result = GenerationResult("ok", TokenUsage(10**9, 10**9, 2 * 10**9), service_tier="default")
+    stream = GatedStream([StreamCompleted(result)], open_gate=True)
+    app, screen = make_priced_app(stream)
+    screen.keys = [*typed("Hi"), idle(app),
+                   Do(lambda: setattr(screen, "rows", 14)), curses.KEY_RESIZE, Do(screen.erase),
+                   Do(lambda: setattr(screen, "cols", 50)), curses.KEY_RESIZE, Do(screen.erase)]
+
+    app.run()  # FakeScreen fails on any out-of-bounds drawing
+
+    assert len(screen.snapshots[-1][0]) == 50
+
+
+def test_usage_command_in_tui_and_while_streaming() -> None:
+    stream = GatedStream([StreamCompleted(GenerationResult("ok", DETAILED, service_tier="default"))],
+                         [TextDelta("x"), StreamCompleted(GenerationResult("x", None))])
+    app, screen = make_priced_app(stream)
+    screen.keys = [*typed("Hi"), Do(lambda: stream.release(1)), idle(app), *typed("/usage"),
+                   *typed("Again"), Wait(lambda: app.request is not None), *typed("\\usage"),
+                   Do(lambda: stream.release(2)), idle(app)]
+
+    app.run()
+
+    reports = [e.text for e in app.state.entries if e.text.startswith("Conversation usage")]
+    assert len(reports) == 2
+    assert "Estimated cost: $0.000149 (ESTIMATED, not a billed amount" in reports[0]
+
+
+def test_f4_menu_for_gpt_6_luna_shows_all_efforts_and_documented_default() -> None:
+    from neurobrau_cli.engine import ChatEngine
+    from neurobrau_cli.providers.openai_provider import OpenAIProvider
+
+    engine = ChatEngine({"openai": OpenAIProvider(MagicClient())}, "openai", "gpt-6-luna", "none")
+    screen = FakeScreen(25, 80, [curses.KEY_F4])
+    app = TuiApp(screen, ChatSettings("openai", "gpt-6-luna", reasoning_effort="none"), engine.reply,
+                 STYLES, ChatSession(), engine)
+
+    app.run()
+
+    frame = next(f for f in reversed(screen.snapshots) if "Enter=OK" in "".join(f))
+    menu = "\n".join(frame)
+    assert "Default" in menu and "model default: medium" in menu
+    labels = [label for label in ("None", "Low", "Medium", "High", "XHigh", "Max") if f"  {label}" in menu
+              or f"* {label}" in menu]
+    assert labels == ["None", "Low", "Medium", "High", "XHigh", "Max"]
+    assert "* None" in menu  # the app's own default stays "none"
+
+
+class MagicClient:
+    """Stands in for the OpenAI client; F4 needs no request."""

@@ -34,11 +34,18 @@ class ProviderError(Exception):
 
 @dataclass(frozen=True)
 class TokenUsage:
-    """Token counts reported by the API."""
+    """Token counts exactly as reported by the API (never estimated). None: not reported.
+
+    `cached_input_tokens` and `cache_write_tokens` are parts of `input_tokens`;
+    `reasoning_tokens` is part of `output_tokens` (billed as output).
+    """
 
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +55,7 @@ class GenerationResult:
     text: str
     usage: TokenUsage | None = None
     reasoning: str | None = None
+    service_tier: str | None = None  # processing tier the provider reports it used
 
 
 @dataclass(frozen=True)
@@ -94,6 +102,7 @@ class ReasoningSupport:
     known: bool = False
     default: str | None = None
     allows_default: bool = True
+    model_default: str | None = None  # what the model uses when no value is sent, if documented
 
     @property
     def supported(self) -> bool:

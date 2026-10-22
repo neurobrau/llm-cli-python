@@ -320,7 +320,7 @@ def test_provider_default_model() -> None:
 @pytest.mark.parametrize(
     ("model", "values", "known", "limit"),
     [
-        ("gpt-6-luna", ("none",), True, None),
+        ("gpt-6-luna", ("none", "low", "medium", "high", "xhigh", "max"), True, None),
         ("gpt-5", ("minimal", "low", "medium", "high"), True, 128_000),
         ("gpt-5-2025-08-07", ("minimal", "low", "medium", "high"), True, 128_000),
         ("gpt-4o", (), True, 16_384),

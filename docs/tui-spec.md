@@ -177,12 +177,19 @@ indented by one space and clipped to 18 columns with `~` marking a cut
 | 7–8 | `F5 MAX TOKENS` | effective limit or `default` |
 | 9–10 | `F6 ANSWER STYLE` | `brief`, `normal` or `detailed` |
 | 11 | `TOKENS` | |
-| 12–13 | | ` in N out N` / ` total N`, or a single ` -` |
+| 12–13 | | ` in N out N` / ` total N`, or a single ` -` when no usage is recorded |
+| next | | ` cached N` (only if > 0), ` reasoning N` (only if > 0), ` context N` (input tokens of the latest completed request) |
+| next | `COST (EST.)` | estimated cost (section 15): ` $0.000149`, ` ~$…` (qualified), ` >=$…` (some requests unpriceable), ` unavailable`, ` $0 (local)`, or ` -` |
 
-`TOKENS` shows **session totals**: the sum over the answers received for
-the current conversation in this run (`?` for a count never reported).
-`/reset`, `/cleanup` and switching provider/model clear it. The settings
-panel is the only place provider, model, settings and tokens are shown.
+`TOKENS` shows **conversation totals**: the sum of the usage records
+stored with the current conversation (section 15), so they survive
+restarts; `?` marks a count never reported. A count is written exactly when
+the line fits the 18 columns, otherwise abbreviated with three significant
+digits (`12.3k`, `4.56M`, `2G`; numbers below 10 000 are never
+abbreviated). `/reset`, `/cleanup` and switching provider/model show the
+new conversation's totals. The settings panel is the only place provider,
+model, settings, tokens and cost are shown; rows beyond the panel height are
+not drawn.
 
 ## 4b. Selection menus (F2–F6)
 
@@ -270,7 +277,7 @@ Ollama: one cached `/api/show`). Items:
 |---|---|
 | unknown (OpenAI model not in the table) | `Default (support unknown)` only, plus an info entry: `Reasoning support for <model> is not confirmed, so only the model's default is offered. --reasoning-effort sends a value explicitly.` |
 | none | no menu; info entry `<model> does not support reasoning.` |
-| values | `Default` (note `model default`; only where omitting the parameter is allowed) followed by the values with labels `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`, `Off`, `On` or the level name capitalized |
+| values | `Default` (note `model default: <effort>` when the model's own default is documented, e.g. `medium` for gpt-6-luna, else `model default`; only where omitting the parameter is allowed) followed by the values with labels `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`, `Off`, `On` or the level name capitalized |
 
 `Default` sends no reasoning parameter. Ollama On/Off models offer no
 `Default`: thinking is always sent, `false` unless On is chosen.
@@ -393,6 +400,7 @@ Esc is recognized after 25 ms (curses `set_escdelay`).
    | `/help`, `\help` | append the help text (commands and keys) as an info entry |
    | `/reset`, `\reset` | start a new empty conversation, clear the panel and token usage, show a notice (below). The previous conversation stays on disk. |
    | `/cleanup`, `\cleanup` | ask for confirmation, then delete all saved conversations (below) |
+   | `/usage`, `\usage` | append the conversation's usage report as an info entry (section 15); also works while a response streams |
    | `/exit`, `\exit` | exit with code 0; the saved conversation is kept |
    | anything else | error entry: `Unknown command: /<name>. Type /help for commands.` |
 
@@ -513,13 +521,14 @@ UTF-8 JSON (non-ASCII written as-is, 2-space indent, trailing newline):
 | `provider` | string, optional | `openai` or `ollama`; written whenever known. Absent in older files, which count as `openai` |
 | `model` | string, optional | model ID the conversation was held with |
 | `messages` | array | chronological; each `{"role": "user" \| "assistant", "content": string}` |
+| `requests` | array, optional | usage records of the conversation's API requests (section 15); omitted when empty, absent in older files |
 
 Readers must accept any RFC 3339 offset (e.g. `+02:00`) and ignore unknown
 fields at the top level and in messages, so newer writers stay compatible.
-Messages are provider-independent text; no reasoning output or token data
-is stored. `provider` and `model` identify who the conversation belongs to,
+Messages are provider-independent text; no reasoning output is stored.
+Token usage is kept separately in `requests`. `provider` and `model` identify who the conversation belongs to,
 so it is never continued with a different one. Writers emit keys in the
-order shown and omit `provider`/`model` when unknown.
+order shown (`requests` last) and omit `provider`/`model` when unknown.
 
 ### Behavior
 
@@ -600,7 +609,7 @@ rate limit 5, timeout 6, connection 7.
 | Max tokens | `max_output_tokens` | `options.num_predict` |
 | Max tokens limit | built-in table (unknown models: none) | `details.context_length` from `/api/tags` |
 | Answer style | `instructions` parameter (system/developer message) | leading `{"role": "system"}` message |
-| Reasoning values | built-in table of confirmed efforts per model (exact ID or dated snapshot `-YYYY-MM-DD`); unknown models: none confirmed | `/api/show` `thinking.values`: `false`/`true` → `off`/`on`, strings → named levels; `thinking` capability without metadata → `off`/`on`; otherwise none |
+| Reasoning values | built-in table of confirmed efforts per model (exact ID or dated snapshot `-YYYY-MM-DD`); unknown models: none confirmed. gpt-6-luna: `none`, `low`, `medium`, `high`, `xhigh`, `max` (documented model default `medium`; the app's own default without a saved or CLI choice stays `none`) | `/api/show` `thinking.values`: `false`/`true` → `off`/`on`, strings → named levels; `thinking` capability without metadata → `off`/`on`; otherwise none |
 | Reasoning parameter | `reasoning.effort`, omitted for `Default` | `think`: sent only if the model has the `thinking` capability: `false` for none/`off`, `true` for `on` or an effort name on an On/Off model, the level string for named levels |
 | Rejected reasoning | value chosen by the user (CLI, F4, saved): error `<model> does not accept reasoning effort '<v>' (…)`, no retry. Built-in default: retry once without it and remember the model for the session | user-chosen thinking on a model without the capability, or an unknown level: error before any chat request |
 | Reasoning output | not requested | `message.thinking`, or a leading `<think>…</think>` block, is moved out of the answer |
@@ -842,3 +851,118 @@ is refused with `WARNING | The cancelled response is still closing; try
 again shortly` (the typed text is kept). On exit the app waits at most
 0.5 s per stream; worker threads are daemons and never block exit. The
 terminal is restored by `curses.wrapper` on every exit path.
+
+## 15. Token accounting and ESTIMATED cost
+
+### Usage records
+
+Every API request that returns usage adds one record to the conversation
+(field `requests` in the conversation file, section 11):
+
+```json
+{"at": "2026-10-22T05:54:29.609Z", "provider": "openai", "model": "gpt-6-luna",
+ "status": "completed", "service_tier": "default",
+ "input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200,
+ "cached_input_tokens": 600, "cache_write_tokens": 100, "reasoning_tokens": 50}
+```
+
+| Field | Rules |
+|---|---|
+| `at` | RFC 3339 UTC, millisecond precision |
+| `provider`, `model` | the selection used |
+| `status` | `completed`, or `incomplete` for an answer cut off early (billed, but its text is not a message) |
+| `service_tier` | optional; the tier the provider reports it used (OpenAI `service_tier`) |
+| counts | optional non-negative integers, **exactly as reported**; absent = not reported. `cached_input_tokens` and `cache_write_tokens` are parts of `input_tokens`; `reasoning_tokens` is part of `output_tokens` |
+
+OpenAI counts come from `usage` (`input_tokens_details.cached_tokens`,
+`input_tokens_details.cache_write_tokens`,
+`output_tokens_details.reasoning_tokens`); Ollama reports only
+`prompt_eval_count` (input) and `eval_count` (output).
+
+Rules:
+* Token counts are **never estimated** from text. A request without
+  reported usage adds no record.
+* One record per request: a streamed answer is recorded once, on
+  `StreamCompleted`; `StreamIncomplete` with usage adds an `incomplete`
+  record; failed and cancelled requests add none (no usage is known).
+* Records belong to their conversation: they move with it when switching
+  provider/model, start empty after `/reset`, and are deleted with it by
+  `/cleanup`. Malformed records are skipped when loading; the conversation
+  still loads.
+* **API usage is not conversation length.** Each request re-sends the whole
+  history, so earlier messages are billed again. Totals are the sum of
+  billed tokens; `context` (panel) and "Latest request input" (`/usage`)
+  show the input of the latest completed request, i.e. what the
+  conversation currently costs per request.
+
+### Pricing catalog (version `2026-10-22`)
+
+USD per 1M tokens, verified on the official pages
+(`developers.openai.com/api/docs/pricing`, `/models/gpt-6-luna`,
+`/models/gpt-5.1`, `/guides/prompt-caching`). Only verified entries are
+included; every other model is "unavailable".
+
+| Model | Context | Input | Cached input | Cache write (30m) | Output |
+|---|---|---|---|---|---|
+| gpt-6-luna | ≤ 272K input tokens | 0.10 | 0.01 | 0.125 | 0.50 |
+| gpt-6-luna | > 272K input tokens | 0.20 | 0.02 | 0.25 | 0.75 |
+| gpt-5.1 | any | 1.25 | 0.125 | billed as input | 10.00 |
+
+Tier multipliers: gpt-6-luna `default` 1, `flex` and `batch` 0.5, `fast`
+(formerly `priority`) 2; gpt-5.1 `default` only. Dated snapshots use their
+base model's prices. All calculations use decimal arithmetic.
+
+### Calculation
+
+For one request with reported input `I`, cached `C`, cache writes `W` and
+output `O`:
+
+```
+cost = ((I - C - W) × input + C × cached + W × write + O × output) × tier / 1 000 000
+```
+
+* Long-context rates apply to the whole request when `I` exceeds the
+  threshold.
+* `write` = the 30m cache-write rate (this app never sets
+  `prompt_cache_retention`, so the default applies); models without a
+  cache-write price bill writes as ordinary input.
+* Reasoning tokens are already part of `O`.
+* Regional/data-residency uplifts do not apply (not used).
+
+| Situation | Result |
+|---|---|
+| all rates and counts known | `estimated` |
+| tier not reported (or `auto`) | `qualified`: Standard assumed |
+| `cached_input_tokens` not reported | `qualified`: all input priced as uncached (an upper bound) |
+| `cache_write_tokens` not reported for a model with a write price | `qualified`: writes priced as input |
+| unknown model, tier without a price, `input`/`output` not reported, or `C + W > I` | `unavailable` (no number) |
+| local Ollama model | `free_local`: `$0` |
+| Ollama cloud model (`:cloud`, `-cloud`) | `unavailable`, never "free" |
+
+Conversation total: all local → `$0 (local)`; otherwise the sum of known
+amounts, `partial` (shown as a lower bound) if any request is unavailable,
+`qualified` if any is qualified, `unavailable` if none is known.
+
+Display: amounts below $0.01 with 6 decimals, otherwise 4 (rounding only for
+display). Every amount is labelled an estimate: panel heading `COST (EST.)`,
+and in `/usage`:
+
+```
+Conversation usage (2 request(s), as reported by the API):
+Input tokens: 2,500
+  of which cached: 1,600
+  of which cache writes: 100
+Output tokens: 300
+  of which reasoning: 50
+Total tokens: 2,800
+Latest request input: 1,500 tokens (the whole history is sent, and billed, with every request)
+Estimated cost: $0.000259 (ESTIMATED, not a billed amount; pricing 2026-10-22)
+```
+
+Qualified: `Estimated cost: approximately $… (ESTIMATED, …; <reasons>)`;
+partial: `at least $…`; unavailable: `Estimated cost: unavailable (<reasons>)`;
+local: `API cost: $0 (local Ollama inference)`; incomplete answers add
+`Includes N incomplete answer(s): billed, but not saved as messages.`
+
+The runtime status bar never shows token totals or cost; it keeps the
+timing metrics of section 5 (Ollama generation speed included).

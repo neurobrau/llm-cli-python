@@ -63,9 +63,9 @@ NON_TEXT_MODEL_MARKERS = (
 # means the model is known not to accept the reasoning parameter. Dated
 # snapshots ("gpt-5-2025-08-07") share their base model's entry.
 KNOWN_MODELS: dict[str, tuple[tuple[str, ...], int | None]] = {
-    # The project's default model; "none" is its specified default effort.
-    # Other efforts are not confirmed yet.
-    "gpt-6-luna": (("none",), None),
+    # The project's default model. Without a saved or CLI choice this app
+    # sends "none" (Task 002); the model's own documented default is "medium".
+    "gpt-6-luna": (("none", "low", "medium", "high", "xhigh", "max"), None),
     "gpt-5.2": (("none", "low", "medium", "high", "xhigh"), 128_000),
     "gpt-5.1": (("none", "low", "medium", "high"), 128_000),
     "gpt-5": (("minimal", "low", "medium", "high"), 128_000),
@@ -80,6 +80,8 @@ KNOWN_MODELS: dict[str, tuple[tuple[str, ...], int | None]] = {
     "gpt-4o": ((), 16_384),
     "gpt-4o-mini": ((), 16_384),
 }
+# The model's own default effort when no reasoning parameter is sent, where documented.
+MODEL_DEFAULT_EFFORTS: dict[str, str] = {"gpt-6-luna": "medium"}
 SNAPSHOT_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
 
 
@@ -93,8 +95,12 @@ def reasoning_support_for(model: str) -> ReasoningSupport:
     if entry is None:
         return ReasoningSupport(known=False)
     efforts = entry[0]
+    base = SNAPSHOT_SUFFIX.sub("", model)
     return ReasoningSupport(
-        values=efforts, known=True, default="none" if "none" in efforts else None
+        values=efforts,
+        known=True,
+        default="none" if "none" in efforts else None,
+        model_default=MODEL_DEFAULT_EFFORTS.get(model) or MODEL_DEFAULT_EFFORTS.get(base),
     )
 
 
@@ -185,7 +191,11 @@ def send_request(request: dict[str, Any], client: OpenAI | None = None) -> Gener
     except openai.OpenAIError as error:
         raise translate_error(error) from error
 
-    return GenerationResult(text=response.output_text, usage=extract_usage(response.usage))
+    return GenerationResult(
+        text=response.output_text,
+        usage=extract_usage(response.usage),
+        service_tier=service_tier_of(response),
+    )
 
 
 def stream_reply(
@@ -255,7 +265,11 @@ def handle_stream_event(
         text = "".join(parts) or (getattr(response, "output_text", "") or "")
         metadata = {"response_id": getattr(response, "id", None), "model": getattr(response, "model", None)}
         return StreamCompleted(
-            GenerationResult(text=text, usage=extract_usage(getattr(response, "usage", None))),
+            GenerationResult(
+                text=text,
+                usage=extract_usage(getattr(response, "usage", None)),
+                service_tier=service_tier_of(response),
+            ),
             {key: value for key, value in metadata.items() if value is not None},
         )
     if kind == "response.incomplete":
@@ -284,15 +298,34 @@ def translated(error: openai.OpenAIError) -> OpenAIProviderError:
     return result
 
 
+def count(value: Any) -> int | None:
+    """A reported token count, or None if missing or not a non-negative integer."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
 def extract_usage(usage: Any) -> TokenUsage | None:
-    """Convert the SDK usage object into TokenUsage, if usage was reported."""
+    """Convert the SDK usage object into TokenUsage, if usage was reported.
+
+    Includes the cache and reasoning breakdowns from `input_tokens_details`
+    and `output_tokens_details` when the API reports them.
+    """
     if usage is None:
         return None
+    inputs = getattr(usage, "input_tokens_details", None)
+    outputs = getattr(usage, "output_tokens_details", None)
     return TokenUsage(
         input_tokens=getattr(usage, "input_tokens", None),
         output_tokens=getattr(usage, "output_tokens", None),
         total_tokens=getattr(usage, "total_tokens", None),
+        cached_input_tokens=count(getattr(inputs, "cached_tokens", None)),
+        cache_write_tokens=count(getattr(inputs, "cache_write_tokens", None)),
+        reasoning_tokens=count(getattr(outputs, "reasoning_tokens", None)),
     )
+
+
+def service_tier_of(response: Any) -> str | None:
+    tier = getattr(response, "service_tier", None)
+    return tier if isinstance(tier, str) else None
 
 
 def translate_error(error: openai.OpenAIError) -> OpenAIProviderError:
