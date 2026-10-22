@@ -6,8 +6,12 @@ The pure parts (layout, wrapping, key handling) are testable with a fake screen.
 
 import curses
 import locale
+import queue
+import signal
 import textwrap
-from collections.abc import Callable
+import threading
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, TypeVar
 
@@ -30,10 +34,22 @@ from neurobrau_cli.chat import (
 from neurobrau_cli.engine import ChatEngine
 from neurobrau_cli.preferences import Preferences, check_max_tokens, label
 from neurobrau_cli.providers import provider_label
-from neurobrau_cli.providers.base import ProviderError, TokenUsage
-from neurobrau_cli.session import ChatSession
+from neurobrau_cli.providers.base import (
+    ProviderError,
+    ReasoningDelta,
+    StreamCompleted,
+    StreamEvent,
+    StreamFailed,
+    StreamIncomplete,
+    TextDelta,
+    TokenUsage,
+)
+from neurobrau_cli.session import ChatSession, StreamFn
 from neurobrau_cli.settings import ANSWER_STYLES, TOKEN_PRESETS
+from neurobrau_cli.ui import status as rt
 from neurobrau_cli.ui.menu import ESCAPE, Menu, MenuItem
+from neurobrau_cli.ui.status import RuntimeStatus
+from neurobrau_cli.ui.worker import QUEUE_SIZE, QueueItem, StreamWorker, WorkerFinished
 
 T = TypeVar("T")
 
@@ -43,6 +59,10 @@ CHROME_ROWS = 7  # top border, 2 separators, status, input, bottom border, help 
 PANEL_WIDTH = 22  # settings panel: separator, space, 18 content columns, space, border
 PANEL_MIN_COLS = 64  # narrower terminals hide the panel
 MENU_MIN_WIDTH = 30
+POLL_MS = 100  # key-read timeout while a request runs: redraw/timer granularity
+EVENTS_PER_REDRAW = 256  # stream events applied between two redraws, at most
+CLOSE_WAIT = 1.0  # seconds a new request waits for a cancelled stream to close
+FLASH_SECONDS = 2.0  # a warning shown during a request outranks the live status this long
 
 USER_LABEL = "YOU > "
 AI_LABEL = "AI > "
@@ -229,13 +249,35 @@ def visible_window(total: int, height: int, scroll: int) -> tuple[int, int]:
     return max(0, end - height), end
 
 
-def format_status_usage(usage: TokenUsage | None) -> str:
-    """Compact token usage for the status panel."""
+def add_usage(total: TokenUsage | None, usage: TokenUsage | None) -> TokenUsage | None:
+    """Session totals: sum each reported count; a count never reported stays None."""
     if usage is None:
-        return "Tokens: -"
-    counts = [usage.input_tokens, usage.output_tokens, usage.total_tokens]
-    shown = ["?" if count is None else str(count) for count in counts]
-    return f"Tokens: in {shown[0]} out {shown[1]} total {shown[2]}"
+        return total
+    if total is None:
+        return usage
+
+    def plus(a: int | None, b: int | None) -> int | None:
+        return b if a is None else a if b is None else a + b
+
+    return TokenUsage(
+        plus(total.input_tokens, usage.input_tokens),
+        plus(total.output_tokens, usage.output_tokens),
+        plus(total.total_tokens, usage.total_tokens),
+    )
+
+
+@dataclass
+class ActiveRequest:
+    """A streaming request in progress; owned by the UI thread."""
+
+    id: int
+    user_text: str
+    worker: StreamWorker
+    started: float
+    first_text: float | None = None  # client time of the first answer text
+    text: str = ""
+    thinking: bool = False
+    entry_index: int | None = None  # the in-progress AI entry
 
 
 @dataclass
@@ -246,8 +288,11 @@ class TuiState:
     input_text: str = ""
     cursor: int = 0
     scroll: int = 0  # lines scrolled up from the newest message
-    usage: TokenUsage | None = None
-    waiting: bool = False
+    usage: TokenUsage | None = None  # session totals for the current conversation
+    waiting: bool = False  # a non-streaming request is blocking
+    status: RuntimeStatus = field(default_factory=RuntimeStatus)
+    after_transient: RuntimeStatus | None = None  # shown when a DONE/... status clears
+    flash: tuple[RuntimeStatus, float] | None = None  # (status, expiry) shown over live activity
     confirming_cleanup: bool = False  # next submitted line answers the cleanup prompt
     busy: str | None = None  # e.g. "LOADING MODELS" while a blocking discovery call runs
     menu: Menu | None = None
@@ -268,8 +313,18 @@ class TuiApp:
         session: ChatSession | None = None,
         engine: ChatEngine | None = None,
         preferences: Preferences | None = None,
+        stream_fn: StreamFn | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.screen = screen
+        self.stream_fn = stream_fn  # None: wait for complete responses
+        self.clock = clock
+        self.events: queue.Queue[QueueItem] = queue.Queue(QUEUE_SIZE)
+        self.request: ActiveRequest | None = None
+        self.closing: StreamWorker | None = None  # cancelled worker still closing its stream
+        self.request_ids = 0
+        self.polling = False  # True while get_wch uses a timeout
+        self.interrupt_pending = False  # Ctrl+C arrived while a stream was active
         self.settings = settings
         self.reply_fn = reply_fn
         self.styles = styles
@@ -293,23 +348,76 @@ class TuiApp:
     # ----- main loop -----
 
     def run(self) -> int:
-        """Run until the user exits. Return the process exit code."""
-        while self.exit_code is None:
-            self.render()
-            try:
-                key = self.screen.get_wch()
-            except KeyboardInterrupt:
-                return EXIT_INTERRUPTED
-            except curses.error:
-                continue  # no input available (e.g. interrupted by a signal)
-            self.handle_key(key)
-        return self.exit_code
+        """Run until the user exits. Return the process exit code.
+
+        All drawing happens here, on the UI thread. While a stream is active,
+        key reads time out every POLL_MS so queued stream events are applied
+        and the elapsed time is redrawn; otherwise the loop blocks on input.
+        """
+        previous = self.install_interrupt_handler()
+        try:
+            while self.exit_code is None:
+                if self.interrupt_pending:
+                    self.interrupt_pending = False
+                    self.cancel_request()
+                self.pump_events()
+                self.render()
+                try:
+                    key = self.read_key()
+                except KeyboardInterrupt:
+                    if self.request is not None:
+                        self.cancel_request()
+                        continue
+                    return EXIT_INTERRUPTED
+                except curses.error:
+                    continue  # no input within the timeout (or interrupted by a signal)
+                self.handle_key(key)
+            return self.exit_code
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGINT, previous)
+            self.stop_workers()
+
+    def install_interrupt_handler(self) -> Any:
+        """Ctrl+C during a stream must cancel it, wherever the UI thread happens to be.
+
+        A SIGINT can arrive mid-redraw or while applying events; raising there
+        could leave state half-updated. While a stream is active the handler
+        only records the request and the loop cancels at a safe point. When
+        idle it raises KeyboardInterrupt as before, so blocking calls (the
+        non-streaming request, model discovery) stay interruptible.
+        """
+        if threading.current_thread() is not threading.main_thread():
+            return None
+
+        def on_sigint(signum: int, frame: object) -> None:
+            if self.request is not None:
+                self.interrupt_pending = True
+            else:
+                raise KeyboardInterrupt
+
+        return signal.signal(signal.SIGINT, on_sigint)
+
+    def read_key(self) -> Key:
+        active = self.request is not None
+        if active != self.polling:
+            self.screen.timeout(POLL_MS if active else -1)
+            self.polling = active
+        return self.screen.get_wch()
 
     def handle_key(self, key: Key) -> None:
         """Apply one key press to the state."""
         state = self.state
+        if key != curses.KEY_RESIZE and state.status.state in rt.TRANSIENT:
+            # DONE/CANCELLED/ERROR/WARNING last until the next user action.
+            state.status = state.after_transient or rt.ready()
+            state.after_transient = None
         if state.menu is not None:
             self.handle_menu_key(key)
+        elif self.request is not None and key in self.function_keys():
+            self.flash(RuntimeStatus(rt.WARNING, ("Settings cannot change while a response is generated",)))
+        elif self.request is not None and key == CTRL_D:
+            pass  # never exit by accident while a response is streaming
         elif state.entering_tokens and key == ESCAPE:
             self.end_token_prompt()
             self.add_entry("info", "Max output tokens unchanged.")
@@ -370,6 +478,9 @@ class TuiApp:
     def submit(self) -> None:
         """Handle the current input line as a command or a message."""
         text = self.state.input_text.strip()
+        if self.request is not None:
+            self.submit_while_streaming(text)
+            return
         self.state.input_text, self.state.cursor = "", 0
         if self.state.entering_tokens:
             self.submit_custom_tokens(text)
@@ -394,8 +505,10 @@ class TuiApp:
             case "reset":
                 warning = self.session.reset()
                 self.clear_panel(reset_notice(self.session))
+                self.state.status = rt.ready("New conversation started")
                 if warning:
                     self.add_entry("error", f"Warning: {warning}")
+                    self.state.status = RuntimeStatus(rt.WARNING, ("Conversation not saved",))
             case "cleanup":
                 count, message = prepare_cleanup(self.session)
                 if message:
@@ -407,25 +520,164 @@ class TuiApp:
                 self.add_entry("error", f"Unknown command: /{command}. Type /help for commands.")
 
     def send(self, text: str) -> None:
-        """Send a message; show a waiting indicator while the request blocks."""
+        """Send a message: streamed in the background, or blocking until complete."""
+        if self.stream_fn is not None:
+            self.start_stream(text)
+            return
         self.add_entry("user", text)
         self.state.waiting = True
         self.state.scroll = 0
         self.render()
+        started = self.clock()
         try:
             result, save_warning = self.session.send(text, self.reply_fn)
         except ProviderError as error:
             self.add_entry("error", f"Error: {error}")
+            self.state.status = RuntimeStatus(rt.ERROR, (str(error),))
         except KeyboardInterrupt:
             self.add_entry("error", "Request cancelled.")
+            self.state.status = RuntimeStatus(rt.CANCELLED)
         else:
             self.add_entry("ai", result.text)
-            if result.usage is not None:
-                self.state.usage = result.usage
-            if save_warning:
-                self.add_entry("error", f"Warning: {save_warning}")
+            self.state.usage = add_usage(self.state.usage, result.usage)
+            self.finish_status({}, result.usage, self.clock() - started, None, save_warning)
         finally:
             self.state.waiting = False
+
+    # ----- streaming (worker thread + queue; see ui/worker.py) -----
+
+    def start_stream(self, text: str) -> None:
+        if self.closing is not None and self.closing.is_alive() and not self.closing.join(CLOSE_WAIT):
+            # Only one network request at a time: the cancelled one has not closed yet.
+            self.state.input_text, self.state.cursor = text, len(text)
+            self.state.status = RuntimeStatus(
+                rt.WARNING, ("The cancelled response is still closing; try again shortly",)
+            )
+            return
+        self.add_entry("user", text)
+        self.state.scroll = 0
+        self.request_ids += 1
+        messages = self.session.conversation.with_user_message(text)
+        worker = StreamWorker(self.request_ids, self.stream_fn, messages, self.events)
+        self.request = ActiveRequest(self.request_ids, text, worker, self.clock())
+        worker.start()
+
+    def submit_while_streaming(self, text: str) -> None:
+        """Only /exit and /help work while a response streams; the typed text is kept."""
+        command = parse_command(text)
+        if command == "exit":
+            self.cancel_request()
+            self.exit_code = EXIT_OK
+        elif command == "help":
+            self.state.input_text, self.state.cursor = "", 0
+            self.add_entry("info", HELP_TEXT)
+        elif text:
+            self.flash(RuntimeStatus(rt.WARNING, ("A response is being generated; wait or press Ctrl+C",)))
+
+    def flash(self, status: RuntimeStatus) -> None:
+        """Show a warning briefly even while CONNECTING/GENERATING is live."""
+        self.state.flash = (status, self.clock() + FLASH_SECONDS)
+
+    def pump_events(self) -> None:
+        """Apply queued stream events on the UI thread (bounded per redraw)."""
+        for _ in range(EVENTS_PER_REDRAW):
+            try:
+                request_id, item = self.events.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(item, WorkerFinished):
+                if self.closing is not None and self.closing.request_id == request_id:
+                    self.closing = None
+            elif self.request is not None and request_id == self.request.id:
+                self.apply_stream_event(item)
+            # Anything else belongs to a cancelled request and is dropped.
+
+    def apply_stream_event(self, event: StreamEvent) -> None:
+        request = self.request
+        assert request is not None
+        if isinstance(event, ReasoningDelta):
+            request.thinking = True  # shown as status only; the trace is never displayed
+        elif isinstance(event, TextDelta):
+            if request.first_text is None:
+                request.first_text = self.clock()
+            request.text += event.text
+            self.show_partial(request)
+        elif isinstance(event, StreamCompleted):
+            self.request = None
+            request.text = event.result.text
+            self.show_partial(request)
+            save_warning = self.session.complete_exchange(request.user_text, request.text)
+            self.state.usage = add_usage(self.state.usage, event.result.usage)
+            first = None if request.first_text is None else request.first_text - request.started
+            self.finish_status(event.metadata, event.result.usage,
+                               self.clock() - request.started, first, save_warning)
+        elif isinstance(event, StreamIncomplete):
+            self.request = None
+            self.add_entry("error", f"Incomplete: {event.reason}.{self.not_saved(request)}")
+            self.state.status = RuntimeStatus(rt.WARNING, (f"Response incomplete: {event.reason}",))
+        elif isinstance(event, StreamFailed):
+            self.request = None
+            self.add_entry("error", f"Error: {event.error}{self.not_saved(request)}")
+            self.state.status = RuntimeStatus(rt.ERROR, (str(event.error),))
+
+    def show_partial(self, request: ActiveRequest) -> None:
+        """Show the answer so far; a user who scrolled up keeps their view."""
+        def update() -> None:
+            entry = Entry("ai", request.text)
+            if request.entry_index is None:
+                request.entry_index = len(self.state.entries)
+                self.state.entries.append(entry)
+            else:
+                self.state.entries[request.entry_index] = entry
+        self.keep_view_anchored(update)
+
+    def keep_view_anchored(self, change: Callable[[], None]) -> None:
+        layout = self.layout()
+        if layout is None or self.state.scroll == 0:
+            change()  # following the newest text
+            return
+        width = layout.conversation_width
+        before = len(transcript_lines(self.state.entries, width))
+        change()
+        self.state.scroll += len(transcript_lines(self.state.entries, width)) - before
+
+    @staticmethod
+    def not_saved(request: ActiveRequest) -> str:
+        return " The partial answer above was not saved." if request.text else ""
+
+    def finish_status(
+        self,
+        metadata: Mapping[str, object],
+        usage: TokenUsage | None,
+        observed: float,
+        first_text: float | None,
+        save_warning: str | None,
+    ) -> None:
+        self.state.status = rt.done_status(metadata, usage, observed, first_text)
+        if save_warning:
+            self.add_entry("error", f"Warning: {save_warning}")
+            self.state.after_transient = RuntimeStatus(rt.WARNING, ("Conversation not saved",))
+        elif self.session.persistent:
+            self.state.after_transient = rt.ready("Conversation saved")
+
+    def cancel_request(self) -> None:
+        """Ctrl+C while streaming: stop showing text, close the stream in the background."""
+        request = self.request
+        if request is None:
+            return
+        self.request = None
+        request.worker.cancel()
+        self.closing = request.worker
+        self.add_entry("error", "Cancelled." + self.not_saved(request))
+        parts = ("Partial response not saved",) if request.text else ()
+        self.state.status = RuntimeStatus(rt.CANCELLED, parts)
+
+    def stop_workers(self) -> None:
+        """On exit: cancel and give streams a moment to close (daemon threads never block exit)."""
+        for worker in (self.request.worker if self.request else None, self.closing):
+            if worker is not None:
+                worker.cancel()
+                worker.join(0.5)
 
     def confirm_cleanup(self, answer: str) -> None:
         """Delete saved conversations only if the user typed the confirmation word."""
@@ -436,8 +688,10 @@ class TuiApp:
         message, success = finish_cleanup(self.session)
         if success:
             self.clear_panel(message)
+            self.state.status = rt.ready("Saved conversations deleted")
         else:
             self.add_entry("error", f"Error: {message}")
+            self.state.status = RuntimeStatus(rt.ERROR, (message,))
 
     def clear_panel(self, notice: str) -> None:
         self.state.entries.clear()
@@ -461,7 +715,7 @@ class TuiApp:
             self.add_entry("error", "Model selection is not available.")
             return
         provider = self.engine.current
-        models = self.run_busy(f"LOADING {provider.label.upper()} MODELS", provider.list_models)
+        models = self.run_busy(f"Loading {provider.label} models", provider.list_models)
         if models is None:
             return
         if not models:
@@ -481,7 +735,7 @@ class TuiApp:
             return
         engine = self.engine
         support = self.run_busy(
-            "CHECKING REASONING", lambda: engine.current.reasoning_support(engine.model)
+            "Checking reasoning support", lambda: engine.current.reasoning_support(engine.model)
         )
         if support is None:
             return
@@ -509,7 +763,7 @@ class TuiApp:
         engine = self.engine
         # Wrapped in a tuple: None means the check failed, (None,) means no known limit.
         checked = self.run_busy(
-            "CHECKING MODEL LIMITS", lambda: (engine.current.max_output_limit(engine.model),)
+            "Checking model limits", lambda: (engine.current.max_output_limit(engine.model),)
         )
         if checked is None:
             return
@@ -626,13 +880,13 @@ class TuiApp:
         if name == self.engine.provider:
             return
         provider = self.engine.providers[name]
-        availability = self.run_busy(f"CHECKING {provider.label.upper()}", provider.check_availability)
+        availability = self.run_busy(f"Checking {provider.label}", provider.check_availability)
         if availability is None:
             return
         if not availability.available:
             self.add_entry("error", f"{provider.label} is not available: {availability.message}")
             return
-        model = self.run_busy(f"CHECKING {provider.label.upper()}", provider.default_model)
+        model = self.run_busy(f"Checking {provider.label}", provider.default_model)
         if model is not None:
             self.switch(name, model)
 
@@ -649,7 +903,7 @@ class TuiApp:
         engine.select(provider, model)
         warning = self.session.switch(provider, model)
         # The new model gets its own saved reasoning/token choices, checked against it.
-        notices = self.run_busy("CHECKING MODEL SETTINGS", lambda: self.preferences.apply(engine))
+        notices = self.run_busy("Checking model settings", lambda: self.preferences.apply(engine))
         self.sync_settings()
         now_using = f"Now using {provider_label(provider)} / {model}."
         if self.session.restored:
@@ -682,8 +936,10 @@ class TuiApp:
             return action()
         except ProviderError as error:
             self.add_entry("error", f"Error: {error}")
+            self.state.status = RuntimeStatus(rt.ERROR, (str(error),))
         except KeyboardInterrupt:
             self.add_entry("error", "Cancelled.")
+            self.state.status = RuntimeStatus(rt.CANCELLED)
         finally:
             self.state.busy = None
             self.state.scroll = 0
@@ -819,32 +1075,40 @@ class TuiApp:
             self.put(row, x0 + width - 1, "|", border, x0 + width)
         self.put(y0 + height - 1, x0, horizontal_rule(width, footer), border, x0 + width)
 
+    def current_status(self) -> RuntimeStatus:
+        """What the runtime bar shows now; activity outranks stored messages."""
+        state, request = self.state, self.request
+        if state.flash is not None:
+            flash, expiry = state.flash
+            if self.clock() < expiry:
+                return flash
+            state.flash = None
+        if request is not None:
+            elapsed = self.clock() - request.started
+            if request.first_text is None and not request.thinking:
+                return rt.active_status(rt.CONNECTING, elapsed)
+            detail = "Thinking" if request.first_text is None else None
+            return rt.active_status(rt.GENERATING, elapsed, detail)
+        if state.waiting:
+            return RuntimeStatus(rt.GENERATING, ("Waiting for the complete response", rt.CANCEL_HINT))
+        if state.busy:
+            return RuntimeStatus(rt.CONNECTING, (state.busy,))
+        if state.confirming_cleanup:
+            return RuntimeStatus(rt.WARNING, (
+                f"Type {CLEANUP_CONFIRMATION} to delete saved conversations; anything else cancels",
+            ))
+        if state.entering_tokens:
+            return rt.ready("Type a token limit and press Enter", "Esc cancels")
+        return state.status
+
     def render_status(self, layout: Layout) -> None:
-        if self.state.waiting:
-            indicator = "[WAITING FOR RESPONSE...]"
-        elif self.state.busy:
-            indicator = f"[{self.state.busy}...]"
-        elif self.state.entering_tokens:
-            indicator = "[ENTER TOKEN LIMIT]"
-        elif self.state.confirming_cleanup:
-            indicator = f"[CONFIRM: TYPE {CLEANUP_CONFIRMATION.upper()}]"
-        else:
-            indicator = "[READY]"
-        details = (
-            f"Provider: {self.settings.provider}  Model: {self.settings.model}  "
-            f"{format_status_usage(self.state.usage)}"
-        )
-        width = layout.inner_width
-        indicator_x = 2 + max(0, width - len(indicator))
-        self.put(layout.status_row, 2, details, self.styles.text, indicator_x - 1)
-        highlighted = (
-            self.state.waiting
-            or self.state.busy
-            or self.state.entering_tokens
-            or self.state.confirming_cleanup
-        )
-        style = self.styles.waiting if highlighted else self.styles.text
-        self.put(layout.status_row, indicator_x, indicator, style, layout.cols - 2)
+        """Runtime bar: STATE word in its color, then ` | `-separated details."""
+        status = self.current_status()
+        attr = getattr(self.styles, rt.STATE_STYLES[status.state])
+        limit = layout.cols - 2
+        self.put(layout.status_row, 2, status.state, attr, limit)
+        details = "".join(rt.SEPARATOR + part for part in status.parts)
+        self.put(layout.status_row, 2 + len(status.state), details, self.styles.text, limit)
 
     def render_input(self, layout: Layout) -> None:
         state = self.state
@@ -959,6 +1223,7 @@ def run_tui(
     session: ChatSession | None = None,
     engine: ChatEngine | None = None,
     preferences: Preferences | None = None,
+    stream_fn: StreamFn | None = None,
 ) -> int:
     """Run the fullscreen chat. `curses.wrapper` restores the terminal on any exit."""
     try:
@@ -977,7 +1242,8 @@ def run_tui(
             curses.set_escdelay(25)  # Esc closes menus; don't wait the default 1 s
         except (AttributeError, curses.error):
             pass
-        return TuiApp(screen, settings, reply_fn, styles, session, engine, preferences).run()
+        app = TuiApp(screen, settings, reply_fn, styles, session, engine, preferences, stream_fn)
+        return app.run()
 
     try:
         return curses.wrapper(main)

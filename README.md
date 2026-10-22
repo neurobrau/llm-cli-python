@@ -28,8 +28,8 @@ neurobrau --answer-style brief "Explain recursion"
 neurobrau --provider ollama --stream "Explain neural networks."   # print text as it arrives
 ```
 
-`--stream` prints the answer while it is generated (one-shot and `--plain`
-chat; the fullscreen UI does not stream yet). With `--usage`, token counts
+`--stream` prints the answer while it is generated, in one-shot mode, the
+`--plain` chat and the fullscreen UI. With `--usage`, token counts
 (and, for Ollama, durations) go to stderr after a complete answer. A
 streamed answer that stops early, e.g. at the token limit, is reported on
 stderr and exits with code 8. In the plain chat, only completed answers are
@@ -73,6 +73,14 @@ is separate from conversation history. CLI flags (`--reasoning-effort`,
 `--max-output-tokens`, `--answer-style`) override saved values for one run
 and are not saved. A saved value the model does not support is ignored with
 a visible note. Format: [docs/tui-spec.md](docs/tui-spec.md#13-settings-file).
+
+The bottom bar of the fullscreen UI shows runtime state only: `READY`,
+`CONNECTING`, `GENERATING` (with elapsed time and `Ctrl+C Cancel`), `DONE`
+(Ollama: total, load and generation time and tokens/s from the API; OpenAI:
+client-observed latency), `CANCELLED`, `ERROR` and `WARNING`. Provider,
+model, settings and session token totals are in the LLM SETTINGS panel.
+With `--stream`, Ctrl+C cancels the answer being generated (it is not
+saved) and the chat continues.
 
 Ollama models are discovered via `/api/tags`. Cloud models that Ollama lists
 (e.g. `glm-4.7:cloud`) run on a remote service and are excluded from

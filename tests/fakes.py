@@ -1,8 +1,29 @@
 """Test doubles shared between test modules."""
 
-from collections.abc import Iterable
+import curses
+import threading
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 from neurobrau_cli.ui import tui
+
+
+@dataclass
+class Wait:
+    """Script step: report "no key yet" until `predicate()` is true (the UI keeps looping)."""
+
+    predicate: Callable[[], bool]
+
+
+@dataclass
+class Do:
+    """Script step: run `action()` (e.g. release stream events), then continue."""
+
+    action: Callable[[], object]
+
+
+STALL_SECONDS = 10.0
 
 
 class FakeScreen:
@@ -40,11 +61,29 @@ class FakeScreen:
     def bkgd(self, char: str, attr: int = 0) -> None:
         pass
 
+    def timeout(self, delay: int) -> None:
+        self.delay = delay  # -1: blocking reads; otherwise polling while a request runs
+
     def refresh(self) -> None:
         self.snapshots.append(self.lines())
 
     def get_wch(self) -> str | int:
+        if not hasattr(self, "started"):
+            self.started = time.monotonic()
+        if time.monotonic() - self.started > STALL_SECONDS:
+            raise AssertionError(f"fake screen script stalled; remaining keys: {self.keys[:5]}")
+        while self.keys and isinstance(self.keys[0], Do):
+            self.keys.pop(0).action()
+        if self.keys and isinstance(self.keys[0], Wait):
+            if not self.keys[0].predicate():
+                time.sleep(0.002)
+                raise curses.error("no input")  # like a get_wch timeout
+            self.keys.pop(0)
+            return self.get_wch()
         if not self.keys:
+            if getattr(self, "delay", -1) >= 0:  # polling while a request runs
+                time.sleep(0.002)
+                raise curses.error("no input")
             return tui.CTRL_D  # end of script: exit like Ctrl+D on empty input
         key = self.keys.pop(0)
         if key == "<CTRL-C>":
@@ -173,3 +212,36 @@ class FakeOllamaStream:
                 yield chunk
         finally:
             self.closed += 1
+
+
+class GatedStream:
+    """stream_fn whose events are released one by one by the test (deterministic threads)."""
+
+    def __init__(self, *scripts: list[object], open_gate: bool = False) -> None:
+        self.scripts = list(scripts)
+        self.gate = threading.Semaphore(10_000 if open_gate else 0)
+        self.calls: list[list[str]] = []
+        self.yielded = 0
+        self.closed = 0
+        self.closed_event = threading.Event()
+
+    def __call__(self, messages):
+        self.calls.append([m.content for m in messages])
+        return self._events(self.scripts.pop(0))
+
+    def _events(self, script: list[object]):
+        try:
+            for event in script:
+                if not self.gate.acquire(timeout=STALL_SECONDS):
+                    raise AssertionError("stream gate was never released")
+                if isinstance(event, BaseException):
+                    raise event
+                self.yielded += 1
+                yield event
+        finally:
+            self.closed += 1
+            self.closed_event.set()
+
+    def release(self, count: int = 1) -> None:
+        for _ in range(count):
+            self.gate.release()

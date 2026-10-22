@@ -128,10 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stream",
         action="store_true",
-        help=(
-            "print the answer while it is generated (one-shot and --plain chat; "
-            "the fullscreen interface does not stream yet)"
-        ),
+        help="print the answer while it is generated (one-shot, --plain chat and fullscreen)",
     )
     parser.add_argument(
         "--plain",
@@ -321,7 +318,12 @@ def run_interactive(args: argparse.Namespace) -> int:
         tui = load_tui()
         if tui is not None:
             exit_code = tui.run_tui(
-                settings, engine.reply, session, engine=engine, preferences=preferences
+                settings,
+                engine.reply,
+                session,
+                engine=engine,
+                preferences=preferences,
+                stream_fn=engine.stream if args.stream else None,
             )
             # curses has restored the terminal by now, so this is normal output.
             if args.transcript_on_exit and session.messages:

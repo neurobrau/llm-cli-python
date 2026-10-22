@@ -187,6 +187,11 @@ class ChatSession:
         warning = self.save() if isinstance(terminal, StreamCompleted) else None
         return terminal, warning
 
+    def complete_exchange(self, text: str, answer: str) -> str | None:
+        """Commit a finished user/assistant pair (e.g. assembled from a stream) and save it."""
+        self.conversation.commit_exchange(text, answer)
+        return self.save()
+
     def reset(self) -> str | None:
         """Start a new empty conversation; the previous one stays on disk.
 

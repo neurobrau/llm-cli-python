@@ -79,8 +79,8 @@ def test_initial_screen_shows_regions_and_status() -> None:
     assert len(lines) == 25 and all(len(line) == 80 for line in lines)
     assert lines[0].startswith(f"+-[ NeuroBräu CLI {__version__} ]")
     assert "[ Status ]" in lines[19]
-    assert "Provider: openai  Model: gpt-test  Tokens: -" in lines[20]
-    assert "[READY]" in lines[20]
+    assert lines[20].startswith("| READY ")  # runtime status only
+    assert not any(word in lines[20] for word in ("Provider", "Model", "gpt-test", "Tokens"))
     assert "[ Input ]" in lines[21]
     assert lines[22].startswith("| YOU > ")
     assert lines[23] == "+" + "-" * 78 + "+"
@@ -204,9 +204,10 @@ def test_waiting_indicator_is_shown_during_request() -> None:
     app, screen, _ = make_app(keys_for("Hi"), RecordingModel())
     app.run()
 
-    assert any("[WAITING FOR RESPONSE...]" in line for line in seen[0])
+    assert any("GENERATING | Waiting for the complete response | Ctrl+C Cancel" in line
+               for line in seen[0])
     assert any("YOU > Hi" in line for line in seen[0])
-    assert any("[READY]" in line for line in screen.snapshots[-1])
+    assert screen.snapshots[-1][20].startswith("| DONE | ")
 
 
 def test_token_usage_is_refreshed_after_response() -> None:
@@ -214,7 +215,8 @@ def test_token_usage_is_refreshed_after_response() -> None:
 
     app.run()
 
-    assert "Tokens: in 11 out 22 total 33" in screen.text()
+    panel = [line[60:78].rstrip() for line in screen.lines()[11:14]]
+    assert panel == ["TOKENS", " in 11 out 22", " total 33"]  # settings panel, not status bar
 
 
 # ----- conversation history -----
@@ -284,7 +286,7 @@ def test_reset_clears_token_usage() -> None:
 
     app.run()
 
-    assert "Tokens: -" in screen.text()
+    assert [line[60:78].rstrip() for line in screen.lines()[11:13]] == ["TOKENS", " -"]
 
 
 @pytest.mark.parametrize("command", ["/exit", "\\exit"])
@@ -517,8 +519,8 @@ def test_cleanup_requires_confirmation(store: HistoryStore, command: str) -> Non
     seen = screen.snapshots[-1]
 
     assert any("Delete 1 saved conversation(s)" in line for line in seen)
-    assert any("[CONFIRM: TYPE YES]" in line for line in seen)
-    assert screen.attr_at("[CONFIRM") == STYLES.waiting
+    assert any("WARNING | Type yes to delete saved conversations" in line for line in seen)
+    assert screen.attr_at("WARNING | Type yes") == STYLES.waiting
     assert len(store.list_paths()) == 1  # not deleted yet: Ctrl+D ended the script
     assert model.calls == []
 
@@ -532,7 +534,7 @@ def test_cleanup_confirmed_deletes_and_clears_screen(store: HistoryStore) -> Non
     assert store.list_paths() == []
     assert "Deleted 1 saved conversation(s)" in screen.text()
     assert "Delete me" not in screen.text()
-    assert "[READY]" in screen.text()
+    assert "READY | Saved conversations deleted" in screen.text()
     assert model.calls == []
 
 
@@ -722,8 +724,8 @@ def test_switching_provider_starts_new_conversation_without_history() -> None:
     assert (app.session.provider, app.session.model) == ("ollama", "qwen3.5:4b")
     text = screen.text()
     assert "Secret" not in text
-    assert " Ollama" in panel_text(screen)
-    assert "Provider: ollama  Model: qwen3.5:4b" in text
+    assert " Ollama" in panel_text(screen) and " qwen3.5:4b" in panel_text(screen)
+    assert "Provider:" not in text  # shown in the settings panel only
 
 
 def test_switch_keeps_previous_conversation_on_disk(store: HistoryStore) -> None:
@@ -834,7 +836,7 @@ def test_busy_indicator_during_discovery() -> None:
     seen: list[tuple[list[str], int]] = []
 
     def record() -> None:
-        seen.append((screen.snapshots[-1], screen.attr_at("[LOADING")))
+        seen.append((screen.snapshots[-1], screen.attr_at("CONNECTING")))
 
     ollama = FakeProvider("ollama", "Ollama", ["q"], on_list=record)
     app, screen, engine = make_engine_app([curses.KEY_F3, curses.KEY_DOWN, "\n", curses.KEY_F2],
@@ -842,9 +844,9 @@ def test_busy_indicator_during_discovery() -> None:
     app.run()
 
     snapshot, attr = seen[0]
-    assert any("[LOADING OLLAMA MODELS...]" in line for line in snapshot)
+    assert any("CONNECTING | Loading Ollama models" in line for line in snapshot)
     assert attr == STYLES.waiting
-    assert any("[READY]" in line for line in screen.snapshots[-1])
+    assert screen.snapshots[-1][20].startswith("| READY")
 
 
 def test_ctrl_d_closes_menu_then_exits() -> None:
@@ -994,7 +996,8 @@ def test_f5_custom_value() -> None:
 
     assert engine.max_output_tokens == 3000
     prompt_frame = next(f for f in screen.snapshots if any("| TOKENS >" in line for line in f))
-    assert any("[ENTER TOKEN LIMIT]" in line for line in prompt_frame)
+    assert any("READY | Type a token limit and press Enter | Esc cancels" in line
+               for line in prompt_frame)
     assert app.state.entering_tokens is False
     assert " 3000" in panel_text(screen)
 

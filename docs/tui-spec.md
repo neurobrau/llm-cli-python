@@ -40,7 +40,8 @@ starts with its messages as normal user/AI entries, followed by:
 
 Baseline size is 80 columns × 25 rows. All regions stretch horizontally;
 only the conversation panel and the LLM SETTINGS panel next to it stretch
-vertically. Exact render at the baseline (input empty, Ollama selected):
+vertically. Exact render at the baseline (input empty, Ollama selected,
+right after a completed answer):
 
 ```
 row  0  +-[ NeuroBräu CLI 0.2.0 ]---------------------------------+-[ LLM SETTINGS ]---+
@@ -49,22 +50,22 @@ row  2  |                                                         |  qwen3.5:4b 
 row  3  | AI > A neural network is a model made of layers of      | F3 PROVIDER        |
 row  4  |      connected units that learn weights from data.      |  Ollama            |
 row  5  |                                                         | F4 REASONING       |
-row  6  |                                                         |  none              |
+row  6  |                                                         |  off               |
 row  7  |                                                         | F5 MAX TOKENS      |
 row  8  |                                                         |  default           |
 row  9  |                                                         | F6 ANSWER STYLE    |
-row 10  |                                                         |  default           |
+row 10  |                                                         |  normal            |
 row 11  |                                                         | TOKENS             |
 row 12  |                                                         |  in 17 out 30      |
 row 13  |                                                         |  total 47          |
  ...    |                                                         |                    |
 row 18  |                                                         |                    |
 row 19  +-[ Status ]----------------------------------------------+--------------------+
-row 20  | Provider: ollama  Model: qwen3.5:4b  Tokens: in 17 out 30 total 47   [READY] |
+row 20  | DONE | 7.17s total | load 0.20s | generation 1.88s | 15.96 tok/s             |
 row 21  +-[ Input ]--------------------------------------------------------------------+
 row 22  | YOU >                                                                        |
 row 23  +------------------------------------------------------------------------------+
-row 24   /help /reset /exit | F2 model F3 provider | PgUp/PgDn scroll | Ctrl+C quit
+row 24   /help /reset /exit | F2-F6 settings | PgUp/PgDn scroll | Ctrl+C quit
 ```
 
 For a terminal of `R` rows and `C` columns:
@@ -75,7 +76,7 @@ For a terminal of `R` rows and `C` columns:
 | Conversation panel | `1` … `R-7` | height `R-7` (18 at baseline), columns `0` … `P` |
 | LLM SETTINGS panel | `1` … `R-7` | columns `P` … `C-1`; see section 4a |
 | Status separator | `R-6` | `+-[ Status ]---…---+`, with `+` at column `P` |
-| Status panel | `R-5` | provider, model, tokens, state indicator |
+| Runtime status bar | `R-5` | dynamic state only (section 5) |
 | Input separator | `R-4` | `+-[ Input ]---…---+` |
 | Input line | `R-3` | `YOU > ` label + editable text |
 | Bottom border | `R-2` | `+---…---+` |
@@ -178,7 +179,10 @@ indented by one space and clipped to 18 columns with `~` marking a cut
 | 11 | `TOKENS` | |
 | 12–13 | | ` in N out N` / ` total N`, or a single ` -` |
 
-Token values follow the status panel (last response; `?` for a missing count).
+`TOKENS` shows **session totals**: the sum over the answers received for
+the current conversation in this run (`?` for a count never reported).
+`/reset`, `/cleanup` and switching provider/model clear it. The settings
+panel is the only place provider, model, settings and tokens are shown.
 
 ## 4b. Selection menus (F2–F6)
 
@@ -220,7 +224,7 @@ A bordered box drawn over the conversation area:
 **F3 provider menu** lists OpenAI and Ollama without any network request.
 Selecting the current provider does nothing. Selecting another provider:
 
-1. shows `[CHECKING <PROVIDER>...]` and checks availability (OpenAI: API key
+1. shows `CONNECTING | Checking <Label>` and checks availability (OpenAI: API key
    present and the Models API answers; Ollama: `/api/tags` answers and at
    least one local model exists);
 2. if unavailable, appends `<Label> is not available: <reason>` as an error
@@ -228,7 +232,7 @@ Selecting the current provider does nothing. Selecting another provider:
 3. otherwise switches to that provider's default model (OpenAI:
    `gpt-6-luna`; Ollama: first local model listed).
 
-**F2 model menu** shows `[LOADING <PROVIDER> MODELS...]` while discovering
+**F2 model menu** shows `CONNECTING | Loading <Label> models` while discovering
 the current provider's models (cached for the rest of the session), then
 opens the menu. Discovery errors become an error entry `Error: <message>`;
 an empty list gives `No selectable <Label> models were found.`
@@ -258,7 +262,7 @@ never start a new conversation, and are saved per model (section 13). Each
 confirmed change appends an info entry ending in `Applies from the next
 message.` Menu navigation itself makes no requests.
 
-**F4 REASONING.** Shows `[CHECKING REASONING...]` while asking the provider
+**F4 REASONING.** Shows `CONNECTING | Checking reasoning support` while asking the provider
 which values the current model supports (OpenAI: built-in table, no request;
 Ollama: one cached `/api/show`). Items:
 
@@ -271,7 +275,7 @@ Ollama: one cached `/api/show`). Items:
 `Default` sends no reasoning parameter. Ollama On/Off models offer no
 `Default`: thinking is always sent, `false` unless On is chosen.
 
-**F5 MAX OUTPUT TOKENS.** Shows `[CHECKING MODEL LIMITS...]` while reading
+**F5 MAX OUTPUT TOKENS.** Shows `CONNECTING | Checking model limits` while reading
 the model's limit (OpenAI table; Ollama `context_length` from the cached
 `/api/tags`). Items: `Default` (note `model default`), `256`, `512`, `1024`,
 `2048`, `4096` (presets above a known limit are left out), then
@@ -279,7 +283,7 @@ the model's limit (OpenAI table; Ollama `context_length` from the cached
 `Custom (<n>)` when the current value is not a preset).
 
 `Custom...` turns the input line into a prompt: label `TOKENS > `, indicator
-`[ENTER TOKEN LIMIT]`, and the info entry
+`READY | Type a token limit and press Enter | Esc cancels`, and the info entry
 `Type the max output tokens (1-<limit>) and press Enter; Esc cancels.` Any
 text typed before is set aside and restored afterwards. On Enter:
 * not digits: error `'<text>' is not a positive whole number. Try again or press Esc.`
@@ -296,34 +300,52 @@ sent as an instruction with each request (section 12) and is never stored
 in the conversation.
 
 **After switching** provider or model (F2/F3), the new model's saved
-reasoning and token choices are applied (`[CHECKING MODEL SETTINGS...]`);
+reasoning and token choices are applied (`CONNECTING | Checking model settings`);
 unsupported saved values fall back with an info entry (section 13). The
 answer style is global and stays.
 
-## 5. Status panel
+## 5. Runtime status bar
 
-Left-aligned:
+Row `R-5` shows **only dynamic runtime state**; provider, model, settings
+and token totals are never repeated here (they are in the settings panel).
+Format, left-aligned and clipped to the content width:
 
 ```
-Provider: <provider>  Model: <model>  Tokens: in <in> out <out> total <total>
+STATE | detail | detail ...
 ```
 
-`Tokens: -` until the first successful response that reports usage, and
-again after `/reset`. Missing individual counts are shown as `?`. Usage shows
-the **last** response, not a session total. It is always visible; the
-`--usage` flag only affects the plain and one-shot modes.
+The state word is drawn in its style, the rest in the text style; parts
+are joined with ` | `.
 
-Right-aligned state indicator, in priority order:
-
-| Indicator | When | Style |
+| State | Style | Shown |
 |---|---|---|
-| `[WAITING FOR RESPONSE...]` | a request is in flight | waiting |
-| `[CHECKING OLLAMA...]`, `[LOADING OPENAI MODELS...]`, `[CHECKING REASONING...]`, … | availability, discovery or capability checks | waiting |
-| `[ENTER TOKEN LIMIT]` | the F5 custom-value prompt is open | waiting |
-| `[CONFIRM: TYPE YES]` | `/cleanup` is waiting for confirmation | waiting |
-| `[READY]` | otherwise | text |
+| `READY` | text | idle; optional detail (e.g. `Conversation saved`, `New conversation started`, `Saved conversations deleted`, `Type a token limit and press Enter \| Esc cancels`) |
+| `CONNECTING` | waiting | a stream started, nothing received yet: `CONNECTING \| 0.4s elapsed \| Ctrl+C Cancel`; also blocking checks: `CONNECTING \| Loading Ollama models` |
+| `GENERATING` | waiting | text is arriving: `GENERATING \| 4.2s elapsed \| Ctrl+C Cancel`; thinking but no text yet: `GENERATING \| Thinking \| 1.3s elapsed \| Ctrl+C Cancel`; non-streaming: `GENERATING \| Waiting for the complete response \| Ctrl+C Cancel` |
+| `DONE` | ai (green) | answer completed (metrics below) |
+| `CANCELLED` | waiting | Ctrl+C: `CANCELLED \| Partial response not saved` (or just `CANCELLED` if no text had arrived) |
+| `ERROR` | error | `ERROR \| <message>` |
+| `WARNING` | waiting | `WARNING \| Response incomplete: <reason>`, `WARNING \| Conversation not saved`, the `/cleanup` confirmation, refused actions |
 
-The left text is truncated so it never overlaps the indicator.
+Elapsed time is client-observed, one decimal, redrawn every 100 ms while a
+request runs.
+
+**DONE metrics** (never estimated; missing values are left out):
+
+* Provider reports durations (Ollama): `DONE | <total>s total | load <l>s | generation <g>s | <r> tok/s`
+  with `r = output tokens / generation seconds`, all from the API's final
+  chunk (`total_duration`, `load_duration`, `eval_duration`, `eval_count`).
+* Otherwise (OpenAI, and any non-streaming answer): client-observed latency only,
+  `DONE | <s>s observed | first text after <f>s` (the second part only when
+  streaming). No tokens-per-second figure is derived from client time.
+
+Seconds have two decimals here.
+
+**Lifetime.** `DONE`, `CANCELLED`, `ERROR` and `WARNING` stay until the next
+key press other than a terminal resize; the bar then returns to `READY`
+(after a saved answer: `READY | Conversation saved`). Live activity outranks
+stored states; a warning raised *during* a request (e.g. pressing Enter or an
+F-key while streaming) is shown over the live state for 2 seconds.
 
 ## 6. Input line
 
@@ -348,7 +370,7 @@ The left text is truncated so it never overlaps the indicator.
 | PgUp / PgDn | scroll conversation by one page |
 | Ctrl+D | exit (only when the input line is empty) |
 | Ctrl+C (idle) | exit with code 130 |
-| Ctrl+C (waiting) | cancel the request, keep running |
+| Ctrl+C (request running) | cancel the request, keep running (streaming: section 14) |
 | F2 | model menu (section 4b) |
 | F3 | provider menu (section 4b) |
 | F4 | reasoning menu (section 4c) |
@@ -385,26 +407,26 @@ Esc is recognized after 25 ms (curses `set_escdelay`).
    * No files: info `No saved conversations.`
    * Otherwise: info entry
      `Delete N saved conversation(s) in <dir>? This cannot be undone. Type 'yes' to confirm: `
-     and the indicator switches to `[CONFIRM: TYPE YES]`. The **next submitted
+     and the status shows `WARNING | Type yes to delete saved conversations; anything else cancels`. The **next submitted
      line** is the answer and is never sent to the model or run as a command.
      Only `yes` (case-insensitive, surrounding spaces ignored) confirms.
      Confirmed: delete, clear the panel, show
      `Deleted N saved conversation(s). Started a new conversation.`
      Anything else: `Cleanup cancelled. Nothing was deleted.`
-3. Otherwise the text is a message:
+3. Otherwise the text is a message. With `--stream` it is streamed
+   (section 14, "In the fullscreen UI"); without it:
    1. Append it to the panel as a user entry.
-   2. Show `[WAITING FOR RESPONSE...]` and redraw **before** the blocking
-      request starts.
+   2. Show `GENERATING | Waiting for the complete response | Ctrl+C Cancel`
+      and redraw **before** the blocking request starts.
    3. Send the committed history plus the new user message.
    4. On success: commit the user/assistant pair to history, append the
-      reply as an AI entry, update token usage, then save the conversation
-      (section 11). If saving fails, append `Warning: <message>` as an error
-      entry; the exchange stays in memory and the chat continues.
-   5. On failure: append `Error: <message>` as an error entry; history is
-      unchanged (the user entry stays visible but is not part of the context).
-   6. Return to `[READY]`.
-
-Responses are not streamed.
+      reply as an AI entry, add its usage to the session totals, then save
+      the conversation (section 11); status `DONE | <s>s observed`. If
+      saving fails, append `Warning: <message>` as an error entry; the
+      exchange stays in memory and the chat continues.
+   5. On failure: append `Error: <message>` as an error entry and show
+      `ERROR | <message>`; history is unchanged (the user entry stays visible
+      but is not part of the context). Ctrl+C: `Request cancelled.`, `CANCELLED`.
 
 ## 9. Exit and terminal restoration
 
@@ -681,8 +703,8 @@ provider/model; F6 saves `answer_style`.
 
 ## 14. Streaming (`--stream`)
 
-The fullscreen UI does not stream yet; this section covers the shared
-engine used by one-shot and plain-chat mode.
+The shared engine below is used by one-shot, plain chat and the fullscreen
+UI (subsection "In the fullscreen UI").
 
 ### Events
 
@@ -765,3 +787,58 @@ The user/assistant pair is committed, and the conversation saved, only after
 `StreamCompleted`, using the assembled text. Incomplete, failed and
 interrupted answers leave the conversation and its file unchanged, and are
 not sent as context later.
+
+### In the fullscreen UI
+
+With `--stream`, a message is sent like this:
+
+1. The user entry is added and the view jumps to the bottom. The request is
+   built on the UI thread from the committed history plus the new message.
+2. A **worker thread** iterates the provider stream and puts
+   `(request id, event)` pairs on a **bounded queue** (64 items; when full
+   the worker waits, re-checking cancellation every 0.1 s). The worker never
+   touches the screen.
+3. The **UI thread** owns all curses calls. While a request runs it reads
+   keys with a 100 ms timeout; each loop iteration applies up to 256 queued
+   events, then redraws once. Typing, editing, scrolling and resizing keep
+   working during the request.
+4. `TextDelta`: the first one creates the AI entry; later ones extend it,
+   re-wrapped with the normal rules. `ReasoningDelta` only switches the
+   status to `Thinking`; the text is never shown.
+5. **Scrolling:** at the bottom (scroll 0) the view follows new text. When the
+   user has scrolled up, the scroll offset grows by the number of lines the
+   update added, so the visible lines do not move.
+6. `StreamCompleted`: the AI entry gets the final assembled text, the
+   user/assistant pair is committed and saved (section 11), usage is added
+   to the session totals, and the status shows `DONE` with metrics.
+7. `StreamIncomplete`: error entry `Incomplete: <reason>.` and
+   `WARNING | Response incomplete: <reason>`. `StreamFailed`: error entry
+   `Error: <message>` and `ERROR | <message>`. In both cases the entry ends
+   with ` The partial answer above was not saved.` if text had been shown;
+   nothing is committed or saved.
+
+While a request runs, only one exists: Enter shows the flashed warning
+`WARNING | A response is being generated; wait or press Ctrl+C` and keeps
+the typed text; F2–F6 show `WARNING | Settings cannot change while a
+response is generated`; Ctrl+D does nothing. `/exit` cancels and exits;
+`/help` works.
+
+**Cancellation (Ctrl+C while a request runs).** The UI immediately stops
+showing the request: its id is retired so later events are dropped, the
+error entry `Cancelled.` (plus ` The partial answer above was not saved.`
+if text was shown) is added, and the status shows `CANCELLED`. The partial
+text stays visible but is never committed or saved. The worker is told to
+stop; it notices after the next event arrives (or its read times out),
+closes the stream, which closes the HTTP connection, and exits. The SIGINT
+handler only records the request while a stream runs, so the cancellation
+happens at a safe point in the loop. When no stream is running, Ctrl+C
+behaves as before (exit, or interrupt a blocking call).
+
+**Limitation:** a read that is blocked waiting for the network cannot be
+interrupted from another thread. A cancelled stream closes when the next
+data arrives or the provider's read timeout expires (Ollama: 300 s). Until
+then a new message waits up to 1 s and, if the old stream is still open,
+is refused with `WARNING | The cancelled response is still closing; try
+again shortly` (the typed text is kept). On exit the app waits at most
+0.5 s per stream; worker threads are daemons and never block exit. The
+terminal is restored by `curses.wrapper` on every exit path.

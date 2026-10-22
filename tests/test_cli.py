@@ -1004,7 +1004,35 @@ def test_plain_chat_streams_and_saves_only_completed_answers(
     ]
 
 
-def test_tui_is_not_streaming_yet(fake_chat_backend: MagicMock, fake_tui: MagicMock) -> None:
+def test_tui_streams_only_with_flag(fake_chat_backend: MagicMock, fake_tui: MagicMock) -> None:
     main(["--stream"])
+    streaming = fake_tui.run_tui.call_args.kwargs
+    main([])
+    blocking = fake_tui.run_tui.call_args.kwargs
 
-    fake_tui.run_tui.assert_called_once()
+    assert streaming["stream_fn"] == streaming["engine"].stream
+    assert blocking["stream_fn"] is None
+
+
+def test_tui_streaming_end_to_end_restores_terminal(
+    fake_ollama: FakeOllama,
+    curses_with_fake_screen: dict[str, object],
+    isolated_state_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Real run_tui with --stream: worker thread, events, save, transcript after curses exits."""
+    from fakes import Wait
+
+    fake_ollama.streaming.bodies = [ollama_chunks("Streamed ", "answer")]
+    curses_with_fake_screen["keys"] = [*type_keys("Hi"),
+                                       Wait(lambda: fake_ollama.streaming.closed == 1),
+                                       Wait(lambda: bool(history_files(isolated_state_home))),
+                                       *type_keys("/exit")]
+
+    assert main(["--provider", "ollama", "--stream", "--transcript-on-exit"]) == 0
+
+    assert curses_with_fake_screen["stdout_during_curses"] == ""
+    assert capsys.readouterr().out == "YOU > Hi\n\nAI > Streamed answer\n"
+    saved = json.loads(history_files(isolated_state_home)[0].read_text())
+    assert [m["content"] for m in saved["messages"]] == ["Hi", "Streamed answer"]
+    assert fake_ollama.chat_payloads[0]["stream"] is True
