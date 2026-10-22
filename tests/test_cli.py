@@ -38,6 +38,8 @@ def test_help_prints_usage_and_exits_successfully(
     assert "usage: neurobrau" in output
     assert "--version" in output
     assert "--reasoning-effort" in output
+    assert "interactive chat" in output
+    assert "--plain" in output
 
 
 def test_version_prints_version_and_exits_successfully(
@@ -50,8 +52,87 @@ def test_version_prints_version_and_exits_successfully(
     assert capsys.readouterr().out.strip() == "neurobrau 0.1.0"
 
 
-def test_no_arguments_returns_zero() -> None:
+@pytest.fixture
+def fake_chat_backend(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Fake client creation and replies for interactive mode."""
+    monkeypatch.setattr(cli.openai_provider, "create_client", MagicMock(name="client"))
+    fake_reply = MagicMock(return_value=GenerationResult(text="Hello!", usage=None))
+    monkeypatch.setattr(cli.openai_provider, "generate_reply", fake_reply)
+    return fake_reply
+
+
+def feed_input(monkeypatch: pytest.MonkeyPatch, *lines: str) -> None:
+    """Replace input() with scripted lines followed by EOF."""
+    items = iter(lines)
+
+    def fake_input(prompt: str) -> str:
+        try:
+            return next(items)
+        except StopIteration:
+            raise EOFError from None
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+
+def test_no_arguments_starts_interactive_chat(
+    fake_chat_backend: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    feed_input(monkeypatch)
+
     assert main([]) == 0
+    out = capsys.readouterr().out
+    assert "NeuroBräu CLI 0.1.0" in out
+    assert "Provider: openai | Model: gpt-6-luna" in out
+    fake_chat_backend.assert_not_called()
+
+
+def test_interactive_mode_uses_model_options(
+    fake_chat_backend: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    feed_input(monkeypatch, "Hi", "/exit")
+
+    exit_code = main(
+        ["--model", "gpt-custom", "--reasoning-effort", "low", "--max-output-tokens", "32"]
+    )
+
+    assert exit_code == 0
+    assert "Model: gpt-custom" in capsys.readouterr().out
+    fake_chat_backend.assert_called_once()
+    args, kwargs = fake_chat_backend.call_args
+    assert [(m.role, m.content) for m in args[0]] == [("user", "Hi")]
+    assert kwargs["model"] == "gpt-custom"
+    assert kwargs["reasoning_effort"] == "low"
+    assert kwargs["max_output_tokens"] == 32
+    assert kwargs["client"] is cli.openai_provider.create_client.return_value
+
+
+def test_interactive_mode_with_usage_prints_usage(
+    fake_chat_backend: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    feed_input(monkeypatch, "Hi")
+
+    main(["--usage"])
+
+    assert "Token usage: not reported" in capsys.readouterr().err
+
+
+def test_interactive_mode_without_api_key_exits_before_chat(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_input = MagicMock()
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    exit_code = main([])
+
+    assert exit_code == 3
+    assert "OPENAI_API_KEY is not set" in capsys.readouterr().err
+    fake_input.assert_not_called()
 
 
 def test_prompt_uses_default_options(
@@ -149,7 +230,6 @@ def test_missing_api_key_fails_gracefully(capsys: pytest.CaptureFixture[str]) ->
         ["--reasoning-effort", "extreme", "Hi"],
         ["--max-output-tokens", "0", "Hi"],
         ["--max-output-tokens", "abc", "Hi"],
-        ["--usage"],
         ["   "],
         ["first", "second"],
     ],
@@ -162,3 +242,93 @@ def test_invalid_arguments_exit_with_usage_error(
 
     assert exc_info.value.code == 2
     fake_generate.assert_not_called()
+
+
+@pytest.fixture
+def fake_tui(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Pretend we run in a real terminal and capture TUI launches."""
+    module = MagicMock()
+    module.run_tui.return_value = 0
+    monkeypatch.setattr(cli, "is_fullscreen_terminal", lambda: True)
+    monkeypatch.setattr(cli, "load_tui", lambda: module)
+    return module
+
+
+def test_interactive_terminal_launches_tui(
+    fake_chat_backend: MagicMock, fake_tui: MagicMock
+) -> None:
+    assert main(["--model", "gpt-custom", "--usage"]) == 0
+
+    fake_tui.run_tui.assert_called_once()
+    settings, reply_fn = fake_tui.run_tui.call_args.args
+    assert settings == cli.chat.ChatSettings("openai", "gpt-custom", show_usage=True)
+    assert reply_fn.keywords["model"] == "gpt-custom"
+
+
+def test_plain_flag_uses_line_chat_in_terminal(
+    fake_chat_backend: MagicMock,
+    fake_tui: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    feed_input(monkeypatch, "/exit")
+
+    assert main(["--plain"]) == 0
+    fake_tui.run_tui.assert_not_called()
+    assert "Goodbye." in capsys.readouterr().out
+
+
+def test_one_shot_prompt_never_launches_tui(
+    fake_generate: MagicMock, fake_tui: MagicMock
+) -> None:
+    assert main(["Hi"]) == 0
+
+    fake_tui.run_tui.assert_not_called()
+    fake_generate.assert_called_once()
+
+
+def test_falls_back_to_plain_chat_when_curses_is_unavailable(
+    fake_chat_backend: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "is_fullscreen_terminal", lambda: True)
+    monkeypatch.setattr(cli, "load_tui", lambda: None)
+    feed_input(monkeypatch)
+
+    assert main([]) == 0
+    assert "NeuroBräu CLI 0.1.0" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("stdin_tty", "stdout_tty", "term", "expected"),
+    [
+        (True, True, "xterm-256color", True),
+        (False, True, "xterm-256color", False),
+        (True, False, "xterm-256color", False),
+        (True, True, "dumb", False),
+        (True, True, None, False),
+    ],
+)
+def test_is_fullscreen_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    stdin_tty: bool,
+    stdout_tty: bool,
+    term: str | None,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(cli.sys, "stdin", MagicMock(isatty=lambda: stdin_tty))
+    monkeypatch.setattr(cli.sys, "stdout", MagicMock(isatty=lambda: stdout_tty))
+    if term is None:
+        monkeypatch.delenv("TERM", raising=False)
+    else:
+        monkeypatch.setenv("TERM", term)
+
+    assert cli.is_fullscreen_terminal() is expected
+
+
+def test_load_tui_returns_curses_module() -> None:
+    module = cli.load_tui()
+
+    assert module is not None
+    assert callable(module.run_tui)

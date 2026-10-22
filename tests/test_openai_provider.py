@@ -7,6 +7,7 @@ import httpx2
 import openai
 import pytest
 
+from neurobrau_cli.conversation import Message
 from neurobrau_cli.providers import openai_provider
 from neurobrau_cli.providers.openai_provider import (
     ErrorKind,
@@ -76,6 +77,42 @@ def test_generate_text_passes_custom_options() -> None:
         store=False,
         max_output_tokens=50,
     )
+
+
+def test_generate_reply_sends_history_as_input_messages() -> None:
+    client = make_client("Fine.")
+    history = [
+        Message("user", "Hi"),
+        Message("assistant", "Hello!"),
+        Message("user", "How are you?"),
+    ]
+
+    result = openai_provider.generate_reply(
+        history, model="gpt-custom", max_output_tokens=20, client=client
+    )
+
+    assert result.text == "Fine."
+    client.responses.create.assert_called_once_with(
+        model="gpt-custom",
+        input=[
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!"},
+            {"role": "user", "content": "How are you?"},
+        ],
+        reasoning={"effort": "none"},
+        store=False,
+        max_output_tokens=20,
+    )
+
+
+def test_generate_reply_translates_sdk_errors() -> None:
+    client = MagicMock()
+    client.responses.create.side_effect = openai.APITimeoutError(request=REQUEST)
+
+    with pytest.raises(OpenAIProviderError) as exc_info:
+        openai_provider.generate_reply([Message("user", "Hi")], client=client)
+
+    assert exc_info.value.kind is ErrorKind.TIMEOUT
 
 
 def test_generate_text_handles_missing_usage() -> None:

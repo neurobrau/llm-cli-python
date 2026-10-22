@@ -1,12 +1,20 @@
-"""OpenAI provider built on the official SDK and the Responses API."""
+"""OpenAI provider built on the official SDK and the Responses API.
+
+Conversation context is sent by replaying prior user/assistant text messages
+as Responses API input items. Full output-item replay (including reasoning
+items and tool calls) is not implemented yet.
+"""
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 import openai
 from openai import OpenAI
+
+from neurobrau_cli.conversation import Message
 
 API_KEY_ENV_VAR = "OPENAI_API_KEY"
 DEFAULT_MODEL = "gpt-6-luna"
@@ -67,7 +75,7 @@ def create_client() -> OpenAI:
 
 
 def build_request(
-    prompt: str,
+    input_: str | list[dict[str, str]],
     model: str,
     reasoning_effort: str,
     max_output_tokens: int | None,
@@ -75,13 +83,18 @@ def build_request(
     """Build keyword arguments for `client.responses.create`."""
     request: dict[str, Any] = {
         "model": model,
-        "input": prompt,
+        "input": input_,
         "reasoning": {"effort": reasoning_effort},
         "store": False,
     }
     if max_output_tokens is not None:
         request["max_output_tokens"] = max_output_tokens
     return request
+
+
+def to_input_items(messages: Sequence[Message]) -> list[dict[str, str]]:
+    """Convert conversation messages into Responses API input messages."""
+    return [{"role": message.role, "content": message.content} for message in messages]
 
 
 def generate_text(
@@ -92,10 +105,29 @@ def generate_text(
     client: OpenAI | None = None,
 ) -> GenerationResult:
     """Send a one-shot prompt to the Responses API and return its text output."""
+    request = build_request(prompt, model, reasoning_effort, max_output_tokens)
+    return send_request(request, client)
+
+
+def generate_reply(
+    messages: Sequence[Message],
+    model: str = DEFAULT_MODEL,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+    max_output_tokens: int | None = None,
+    client: OpenAI | None = None,
+) -> GenerationResult:
+    """Send a conversation, oldest message first, and return the model's reply."""
+    request = build_request(
+        to_input_items(messages), model, reasoning_effort, max_output_tokens
+    )
+    return send_request(request, client)
+
+
+def send_request(request: dict[str, Any], client: OpenAI | None = None) -> GenerationResult:
+    """Call the Responses API and convert SDK errors into provider errors."""
     if client is None:
         client = create_client()
 
-    request = build_request(prompt, model, reasoning_effort, max_output_tokens)
     try:
         response = client.responses.create(**request)
     except openai.OpenAIError as error:
