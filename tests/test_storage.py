@@ -302,3 +302,36 @@ def test_restoring_tightens_existing_directories(store: HistoryStore) -> None:
 
     assert mode_of(store.directory) == 0o700
     assert mode_of(store.directory.parent) == 0o700
+
+
+def test_provider_and_model_round_trip(store: HistoryStore) -> None:
+    conversation = StoredConversation(ID_A, T0, T0, (), "ollama", "qwen3.5:4b")
+    store.save(conversation)
+
+    data = json.loads(store.path_for(ID_A).read_text())
+    loaded = store.load(store.path_for(ID_A))
+
+    assert list(data) == [
+        "schema_version", "id", "created_at", "updated_at", "provider", "model", "messages"
+    ]
+    assert (loaded.provider, loaded.model) == ("ollama", "qwen3.5:4b")
+
+
+@pytest.mark.parametrize("value", [42, "", ["x"]])
+def test_invalid_provider_metadata_is_corrupt(store: HistoryStore, value: object) -> None:
+    store.ensure_directory()
+    data = storage.to_json(make_conversation())
+    data["provider"] = value
+    store.path_for(ID_A).write_text(json.dumps(data))
+
+    with pytest.raises(HistoryError, match="'provider' must be a non-empty string"):
+        store.load(store.path_for(ID_A))
+
+
+def test_load_latest_with_filter(store: HistoryStore) -> None:
+    store.save(StoredConversation(ID_A, T0, T0 + timedelta(hours=1), (), "openai", "m"))
+    store.save(StoredConversation(ID_B, T0, T0, (), "ollama", "m"))
+
+    latest, _ = store.load_latest(lambda conversation: conversation.provider == "ollama")
+
+    assert latest is not None and latest.id == ID_B

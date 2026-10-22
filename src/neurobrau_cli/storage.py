@@ -9,7 +9,7 @@ import json
 import os
 import tempfile
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +36,8 @@ class StoredConversation:
     created_at: datetime
     updated_at: datetime
     messages: tuple[Message, ...] = ()
+    provider: str | None = None  # optional; absent in files written before Task 006
+    model: str | None = None
 
 
 def utc_now() -> datetime:
@@ -78,16 +80,20 @@ def parse_timestamp(value: object, field: str) -> datetime:
 
 
 def to_json(conversation: StoredConversation) -> dict[str, Any]:
-    return {
+    data: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "id": conversation.id,
         "created_at": format_timestamp(conversation.created_at),
         "updated_at": format_timestamp(conversation.updated_at),
-        "messages": [
-            {"role": message.role, "content": message.content}
-            for message in conversation.messages
-        ],
     }
+    if conversation.provider is not None:
+        data["provider"] = conversation.provider
+    if conversation.model is not None:
+        data["model"] = conversation.model
+    data["messages"] = [
+        {"role": message.role, "content": message.content} for message in conversation.messages
+    ]
+    return data
 
 
 def from_json(data: object) -> StoredConversation:
@@ -121,7 +127,18 @@ def from_json(data: object) -> StoredConversation:
         created_at=parse_timestamp(data.get("created_at"), "created_at"),
         updated_at=parse_timestamp(data.get("updated_at"), "updated_at"),
         messages=tuple(messages),
+        provider=optional_string(data, "provider"),
+        model=optional_string(data, "model"),
     )
+
+
+def optional_string(data: dict[str, Any], field: str) -> str | None:
+    value = data.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"'{field}' must be a non-empty string")
+    return value
 
 
 def is_valid_id(value: str) -> bool:
@@ -169,10 +186,13 @@ class HistoryStore:
                 "The file was left unchanged."
             ) from error
 
-    def load_latest(self) -> tuple[StoredConversation | None, list[str]]:
+    def load_latest(
+        self, matches: Callable[[StoredConversation], bool] | None = None
+    ) -> tuple[StoredConversation | None, list[str]]:
         """Return the most recently updated valid conversation and any warnings.
 
-        Unreadable or corrupt files are reported, skipped, and never modified.
+        `matches` limits the choice (e.g. to one provider). Unreadable or
+        corrupt files are reported, skipped, and never modified.
         """
         warnings: list[str] = []
         self.secure_existing_directories()
@@ -194,6 +214,8 @@ class HistoryStore:
                 continue
             except OSError as error:
                 warnings.append(describe_os_error("read", path, error))
+                continue
+            if matches is not None and not matches(candidate):
                 continue
             if latest_key is None or key > latest_key:
                 latest, latest_key = candidate, key

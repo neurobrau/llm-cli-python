@@ -172,3 +172,91 @@ def test_session_without_store_never_touches_disk(tmp_path: Path) -> None:
     assert session.saved_count() == 0
     assert session.cleanup() == 0
     assert list(tmp_path.iterdir()) == []
+
+
+# ----- provider and model selection -----
+
+
+def test_provider_and_model_are_saved(store: HistoryStore) -> None:
+    session = ChatSession.restore(store, provider="ollama", model="qwen3.5:4b")
+    session.send("Hi", echo)
+
+    data = json.loads(store.path_for(session.id).read_text())
+
+    assert (data["provider"], data["model"]) == ("ollama", "qwen3.5:4b")
+
+
+def test_switch_starts_new_conversation_and_keeps_old_file(store: HistoryStore) -> None:
+    session = ChatSession.restore(store, Clock(), provider="openai", model="gpt-x")
+    session.send("Secret context", echo)
+    old_id = session.id
+
+    assert session.switch("ollama", "qwen3.5:4b") is None
+
+    assert session.id != old_id
+    assert session.messages == ()
+    assert len(saved_messages(store, ChatSession(store, store.load(store.path_for(old_id))))) == 2
+    assert ChatSession.restore(store).provider == "ollama"  # the new selection is "active"
+
+
+def test_switch_never_forwards_history(store: HistoryStore) -> None:
+    session = ChatSession.restore(store, provider="openai", model="gpt-x")
+    session.send("Secret context", echo)
+    seen: list[list[Message]] = []
+
+    session.switch("ollama", "qwen3.5:4b")
+    session.send("New topic", lambda messages: (seen.append(list(messages)), echo(messages))[1])
+
+    assert seen == [[Message("user", "New topic")]]
+
+
+def test_switch_to_same_selection_changes_nothing(store: HistoryStore) -> None:
+    session = ChatSession.restore(store, provider="openai", model="gpt-x")
+    session.send("Keep", echo)
+
+    session.switch("openai", "gpt-x")
+
+    assert len(session.messages) == 2
+    assert len(store.list_paths()) == 1
+
+
+def test_switch_of_empty_conversation_reuses_it(store: HistoryStore) -> None:
+    session = ChatSession.restore(store, provider="openai", model="gpt-x")
+    original_id = session.id
+
+    session.switch("openai", "gpt-y")
+
+    assert session.id == original_id
+    assert len(store.list_paths()) == 1
+
+
+def test_restore_filters_by_provider_and_model(store: HistoryStore) -> None:
+    clock = Clock()
+    openai = ChatSession.restore(store, clock, provider="openai", model="gpt-x")
+    openai.send("OpenAI chat", echo)
+    ollama = ChatSession.restore(store, clock, provider="ollama", model="qwen3.5:4b")
+    ollama.send("Ollama chat", echo)
+
+    assert ChatSession.restore(store, provider="openai").messages[0].content == "OpenAI chat"
+    assert ChatSession.restore(store, provider="ollama").messages[0].content == "Ollama chat"
+    assert ChatSession.restore(store).provider == "ollama"  # most recent overall
+    other_model = ChatSession.restore(store, provider="ollama", model="llama3.2:3b")
+    assert other_model.messages == ()
+    assert other_model.model == "llama3.2:3b"
+
+
+def test_restore_by_provider_adopts_saved_model(store: HistoryStore) -> None:
+    ChatSession.restore(store, provider="ollama", model="llama3.2:3b").send("Hi", echo)
+
+    session = ChatSession.restore(store, provider="ollama")
+
+    assert session.model == "llama3.2:3b"
+
+
+def test_legacy_file_without_metadata_counts_as_openai(store: HistoryStore) -> None:
+    ChatSession.restore(store).send("Old chat", echo)  # no provider/model, like Task 005
+
+    assert ChatSession.restore(store, provider="openai", model="gpt-6-luna").restored
+    assert not ChatSession.restore(store, provider="ollama").restored
+    legacy = ChatSession.restore(store)
+    assert (legacy.provider, legacy.model) == ("openai", None)

@@ -7,55 +7,50 @@ items and tool calls) is not implemented yet.
 
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
 import openai
 from openai import OpenAI
 
 from neurobrau_cli.conversation import Message
+from neurobrau_cli.providers.base import (
+    Availability,
+    ErrorKind,
+    GenerationOptions,
+    GenerationResult,
+    ModelInfo,
+    ProviderError,
+    TokenUsage,
+)
+
+__all__ = [
+    "ErrorKind",
+    "GenerationResult",
+    "OpenAIProvider",
+    "OpenAIProviderError",
+    "TokenUsage",
+    "generate_reply",
+    "generate_text",
+]
 
 API_KEY_ENV_VAR = "OPENAI_API_KEY"
 DEFAULT_MODEL = "gpt-6-luna"
 DEFAULT_REASONING_EFFORT = "none"
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+DISCOVERY_TIMEOUT = 5.0  # seconds for the Models API
+
+# The Models API lists every model the key can access, including ones that
+# cannot produce text through the Responses API. These ID fragments hide the
+# obvious ones from the model menu. It is a heuristic: a listed model can still
+# be rejected, which is reported as a normal API error.
+NON_TEXT_MODEL_MARKERS = (
+    "embedding", "tts", "whisper", "dall-e", "moderation", "transcribe",
+    "realtime", "audio", "image",
+)
 
 
-class ErrorKind(Enum):
-    """Categories of provider failures, so callers can react to each one."""
-
-    MISSING_API_KEY = "missing_api_key"
-    AUTHENTICATION = "authentication"
-    RATE_LIMIT = "rate_limit"
-    TIMEOUT = "timeout"
-    CONNECTION = "connection"
-    API = "api"
-
-
-class OpenAIProviderError(Exception):
+class OpenAIProviderError(ProviderError):
     """A user-facing, credential-free error raised by the OpenAI provider."""
-
-    def __init__(self, message: str, kind: ErrorKind = ErrorKind.API) -> None:
-        super().__init__(message)
-        self.kind = kind
-
-
-@dataclass(frozen=True)
-class TokenUsage:
-    """Token counts reported by the API."""
-
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    total_tokens: int | None = None
-
-
-@dataclass(frozen=True)
-class GenerationResult:
-    """Text output and optional token usage of a single generation."""
-
-    text: str
-    usage: TokenUsage | None = None
 
 
 def read_api_key() -> str:
@@ -77,16 +72,18 @@ def create_client() -> OpenAI:
 def build_request(
     input_: str | list[dict[str, str]],
     model: str,
-    reasoning_effort: str,
+    reasoning_effort: str | None,
     max_output_tokens: int | None,
 ) -> dict[str, Any]:
-    """Build keyword arguments for `client.responses.create`."""
-    request: dict[str, Any] = {
-        "model": model,
-        "input": input_,
-        "reasoning": {"effort": reasoning_effort},
-        "store": False,
-    }
+    """Build keyword arguments for `client.responses.create`.
+
+    `reasoning_effort=None` omits the reasoning parameter entirely, for models
+    that reject it.
+    """
+    request: dict[str, Any] = {"model": model, "input": input_}
+    if reasoning_effort is not None:
+        request["reasoning"] = {"effort": reasoning_effort}
+    request["store"] = False
     if max_output_tokens is not None:
         request["max_output_tokens"] = max_output_tokens
     return request
@@ -100,7 +97,7 @@ def to_input_items(messages: Sequence[Message]) -> list[dict[str, str]]:
 def generate_text(
     prompt: str,
     model: str = DEFAULT_MODEL,
-    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+    reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
     max_output_tokens: int | None = None,
     client: OpenAI | None = None,
 ) -> GenerationResult:
@@ -112,7 +109,7 @@ def generate_text(
 def generate_reply(
     messages: Sequence[Message],
     model: str = DEFAULT_MODEL,
-    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+    reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
     max_output_tokens: int | None = None,
     client: OpenAI | None = None,
 ) -> GenerationResult:
@@ -172,3 +169,79 @@ def translate_error(error: openai.OpenAIError) -> OpenAIProviderError:
             return OpenAIProviderError(f"OpenAI API error (HTTP {status_code}): {error.message}")
         case _:
             return OpenAIProviderError(f"OpenAI request failed: {type(error).__name__}")
+
+
+def rejects_reasoning(error: ProviderError) -> bool:
+    """True if the API refused the request because of the reasoning parameter."""
+    cause = error.__cause__
+    param = getattr(cause, "param", None) if isinstance(cause, openai.BadRequestError) else None
+    return isinstance(param, str) and param.startswith("reasoning")
+
+
+def is_text_model(model_id: str) -> bool:
+    return not any(marker in model_id for marker in NON_TEXT_MODEL_MARKERS)
+
+
+class OpenAIProvider:
+    """`Provider` implementation for the OpenAI Responses API."""
+
+    name = "openai"
+    label = "OpenAI"
+
+    def __init__(self, client: OpenAI | None = None) -> None:
+        self._client = client
+        self._models: list[ModelInfo] | None = None
+        self._no_reasoning: set[str] = set()  # models that rejected the reasoning parameter
+
+    def client(self) -> OpenAI:
+        """The SDK client, created on first use. Raises if OPENAI_API_KEY is missing."""
+        if self._client is None:
+            self._client = create_client()
+        return self._client
+
+    def generate(self, messages: Sequence[Message], options: GenerationOptions) -> GenerationResult:
+        effort = None if options.model in self._no_reasoning else options.reasoning_effort
+        try:
+            return self._generate(messages, options, effort)
+        except OpenAIProviderError as error:
+            # Not every model supports reasoning. Retry once without it and
+            # remember the model, instead of failing every message.
+            if effort is None or not rejects_reasoning(error):
+                raise
+        self._no_reasoning.add(options.model)
+        return self._generate(messages, options, None)
+
+    def _generate(
+        self, messages: Sequence[Message], options: GenerationOptions, effort: str | None
+    ) -> GenerationResult:
+        return generate_reply(
+            list(messages),
+            model=options.model,
+            reasoning_effort=effort,
+            max_output_tokens=options.max_output_tokens,
+            client=self.client(),
+        )
+
+    def list_models(self, refresh: bool = False) -> list[ModelInfo]:
+        """Text-capable model IDs from the Models API, sorted. One bounded request."""
+        if self._models is not None and not refresh:
+            return self._models
+        client = self.client()
+        try:
+            page = client.with_options(max_retries=0).models.list(timeout=DISCOVERY_TIMEOUT)
+            ids = sorted({model.id for model in page if is_text_model(model.id)})
+        except openai.OpenAIError as error:
+            raise translate_error(error) from error
+        self._models = [ModelInfo(model_id) for model_id in ids]
+        return self._models
+
+    def check_availability(self) -> Availability:
+        """Credentials are present and the API answers (reuses the model list)."""
+        try:
+            self.list_models()
+        except ProviderError as error:
+            return Availability(False, str(error))
+        return Availability(True)
+
+    def default_model(self) -> str:
+        return DEFAULT_MODEL

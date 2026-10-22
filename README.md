@@ -1,15 +1,19 @@
 # NeuroBräu CLI — Python
 
-Educational multi-provider LLM command-line client. Currently supports OpenAI
-via the Responses API.
+Educational multi-provider LLM command-line client. Supports OpenAI (Responses
+API) and local models through [Ollama](https://ollama.com)'s native HTTP API.
 
 ## Setup
 
 ```bash
 python -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-export OPENAI_API_KEY="..."   # read from the environment only
+export OPENAI_API_KEY="..."   # read from the environment only; not needed for Ollama
 ```
+
+For Ollama, run the Ollama service locally (default `http://127.0.0.1:11434`,
+override with `OLLAMA_HOST`) and install a model yourself, e.g.
+`ollama pull qwen3.5:4b`. NeuroBräu never downloads models.
 
 ## Usage
 
@@ -18,6 +22,8 @@ One-shot prompt:
 ```bash
 neurobrau "What is a neural network?"
 neurobrau --model MODEL_ID --reasoning-effort low --max-output-tokens 200 --usage "Explain backprop"
+neurobrau --provider ollama --model qwen3.5:4b "Hello"
+neurobrau --provider ollama "Hello"     # first local model listed by Ollama
 ```
 
 Interactive chat (no prompt argument; model options still apply):
@@ -26,7 +32,20 @@ Interactive chat (no prompt argument; model options still apply):
 neurobrau                  # fullscreen DOS-style UI in a terminal
 neurobrau --plain          # line-oriented chat
 neurobrau --model MODEL_ID --usage
+neurobrau --provider ollama
 ```
+
+Without `--provider`/`--model`, an interactive chat continues the most recent
+conversation with the provider and model it was held with. In the fullscreen
+UI, the **LLM SETTINGS** panel shows the current selection; **F2** picks a
+model and **F3** a provider (OpenAI or Ollama) from DOS-style menus. Changing
+either starts a new conversation (the previous one stays saved) and never
+sends earlier messages to the new model. F4–F6 (reasoning, max tokens,
+answer style) are display-only for now.
+
+Ollama models are discovered via `/api/tags`. Cloud models that Ollama lists
+(e.g. `glm-4.7:cloud`) run on a remote service and are excluded from
+selection and never contacted; only local models are used.
 
 The fullscreen UI starts only when stdin and stdout are terminals; otherwise
 the line-oriented chat is used. Layout, colors and keys are specified in
@@ -92,6 +111,14 @@ already in your scrollback). The transcript includes restored messages.
 
 ## Limitations
 
+- OpenAI's model list hides obvious non-text models by name; other listed
+  models may still be rejected by the Responses API (shown as an error).
+  Models that reject the reasoning parameter are retried once without it.
+- Reasoning returned by Ollama is kept separate and currently not shown.
+- Discovery and availability checks block the UI briefly (bounded by 5 s for
+  OpenAI and 3 s for Ollama). Ollama chat requests time out after 300 s.
+- F-keys and arrows rely on the terminal matching its `TERM` setting; an
+  unrecognized escape sequence may be read as Esc followed by typed text.
 - Running two chats at once against the same history directory can lose
   messages: both continue the same conversation and the last save wins.
 - Requests use `store=False`. Context is sent by replaying prior user and

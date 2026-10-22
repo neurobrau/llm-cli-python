@@ -17,7 +17,9 @@ from neurobrau_cli.providers.openai_provider import (
 )
 from neurobrau_cli.ui.tui import Styles
 
-from fakes import FakeScreen
+from neurobrau_cli.providers.ollama_provider import OllamaProviderError
+
+from fakes import CLOUD_TAG, QWEN_TAG, FakeOllama, FakeScreen
 
 
 @pytest.fixture
@@ -269,9 +271,13 @@ def test_interactive_terminal_launches_tui(
 
     fake_tui.run_tui.assert_called_once()
     settings, reply_fn, session = fake_tui.run_tui.call_args.args
+    engine = fake_tui.run_tui.call_args.kwargs["engine"]
     assert session.persistent
-    assert settings == cli.chat.ChatSettings("openai", "gpt-custom", show_usage=True)
-    assert reply_fn.keywords["model"] == "gpt-custom"
+    assert (settings.provider, settings.model, settings.show_usage) == (
+        "openai", "gpt-custom", True
+    )
+    assert reply_fn == engine.reply
+    assert (engine.provider, engine.model) == ("openai", "gpt-custom")
 
 
 def test_plain_flag_uses_line_chat_in_terminal(
@@ -492,3 +498,133 @@ def test_no_transcript_without_flag_or_messages(
     curses_with_fake_screen["keys"] = type_keys("/exit")
     main(["--no-history", "--transcript-on-exit"])
     assert capsys.readouterr().out == ""
+
+
+# ----- Ollama and provider selection -----
+
+
+@pytest.fixture
+def fake_ollama(monkeypatch: pytest.MonkeyPatch) -> FakeOllama:
+    """Replace Ollama's HTTP transport; no network access."""
+    fake = FakeOllama()
+    monkeypatch.setattr(cli.ollama_provider, "urllib_transport", fake)
+    return fake
+
+
+def test_one_shot_ollama(fake_ollama: FakeOllama, capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(["--provider", "ollama", "--model", "qwen3.5:4b", "--usage", "Hello"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert captured.out == "local reply 1\n"
+    assert captured.err == "Token usage: input=10, output=5, total=15\n"
+    assert fake_ollama.chat_payloads[0]["messages"] == [{"role": "user", "content": "Hello"}]
+    assert fake_ollama.chat_payloads[0]["think"] is False
+
+
+def test_one_shot_ollama_defaults_to_first_local_model(fake_ollama: FakeOllama) -> None:
+    fake_ollama.models = [CLOUD_TAG, QWEN_TAG]
+
+    main(["--provider", "ollama", "Hello"])
+
+    assert fake_ollama.chat_payloads[0]["model"] == "qwen3.5:4b"
+
+
+def test_one_shot_ollama_refuses_cloud_model(
+    fake_ollama: FakeOllama, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = main(["--provider", "ollama", "--model", "glm-4.7:cloud", "Hello"])
+
+    assert exit_code == 1
+    assert "cloud model" in capsys.readouterr().err
+    assert fake_ollama.chat_payloads == []
+
+
+def test_one_shot_ollama_not_running(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def down(*args: object) -> object:
+        raise OllamaProviderError("Could not connect to Ollama.", ErrorKind.CONNECTION)
+
+    monkeypatch.setattr(cli.ollama_provider, "urllib_transport", down)
+
+    assert main(["--provider", "ollama", "Hello"]) == 7
+    assert "Could not connect to Ollama." in capsys.readouterr().err
+
+
+def test_ollama_needs_no_openai_key(
+    fake_ollama: FakeOllama, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    feed_input(monkeypatch, "Hi")
+
+    assert main(["--provider", "ollama"]) == 0
+    out = capsys.readouterr().out
+    assert "Provider: ollama | Model: qwen3.5:4b" in out
+    assert "AI > local reply 1" in out
+
+
+def test_interactive_ollama_history_is_saved_with_provider(
+    fake_ollama: FakeOllama, monkeypatch: pytest.MonkeyPatch, isolated_state_home: Path
+) -> None:
+    feed_input(monkeypatch, "Hi")
+    main(["--provider", "ollama", "--model", "qwen3.5:4b"])
+
+    data = json.loads(history_files(isolated_state_home)[0].read_text())
+    assert (data["provider"], data["model"]) == ("ollama", "qwen3.5:4b")
+
+
+def test_plain_launch_resumes_last_provider_and_model(
+    fake_ollama: FakeOllama, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    feed_input(monkeypatch, "My name is Ada.")
+    main(["--provider", "ollama"])
+    capsys.readouterr()
+
+    feed_input(monkeypatch, "What is my name?")
+    assert main([]) == 0  # no OPENAI_API_KEY needed: the last conversation was Ollama
+
+    assert "Provider: ollama | Model: qwen3.5:4b" in capsys.readouterr().out
+    assert [m["content"] for m in fake_ollama.chat_payloads[-1]["messages"]] == [
+        "My name is Ada.", "local reply 1", "What is my name?"
+    ]
+
+
+def test_explicit_provider_does_not_receive_other_providers_history(
+    fake_ollama: FakeOllama,
+    fake_chat_backend: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    feed_input(monkeypatch, "Ollama secret")
+    main(["--provider", "ollama"])
+
+    feed_input(monkeypatch, "Hi OpenAI")
+    main(["--provider", "openai"])
+
+    history = fake_chat_backend.call_args.args[0]
+    assert [m.content for m in history] == ["Hi OpenAI"]
+
+
+def test_interactive_ollama_without_models_fails_cleanly(
+    fake_ollama: FakeOllama, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_ollama.models = [CLOUD_TAG]
+
+    assert main(["--provider", "ollama"]) == 1
+    err = capsys.readouterr().err
+    assert "No local Ollama models are installed" in err
+    assert "Traceback" not in err
+
+
+def test_tui_receives_engine_for_ollama(fake_ollama: FakeOllama, fake_tui: MagicMock) -> None:
+    main(["--provider", "ollama"])
+
+    engine = fake_tui.run_tui.call_args.kwargs["engine"]
+    assert (engine.provider, engine.model) == ("ollama", "qwen3.5:4b")
+    assert set(engine.providers) == {"openai", "ollama"}
+
+
+def test_provider_choices_exclude_unsupported(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--provider", "anthropic", "Hi"])
+
+    assert "invalid choice" in capsys.readouterr().err

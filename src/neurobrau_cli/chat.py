@@ -7,7 +7,7 @@ from typing import TextIO
 
 from neurobrau_cli import __version__
 from neurobrau_cli.formatting import format_usage
-from neurobrau_cli.providers.openai_provider import OpenAIProviderError
+from neurobrau_cli.providers.base import ProviderError
 from neurobrau_cli.session import ChatSession, ReplyFn, exchange
 from neurobrau_cli.storage import HistoryError
 
@@ -39,6 +39,8 @@ class ChatSettings:
     provider: str
     model: str
     show_usage: bool = False
+    reasoning_effort: str | None = None
+    max_output_tokens: int | None = None
 
 
 def parse_command(text: str) -> str | None:
@@ -164,7 +166,7 @@ def send_message(
     """Send a user message and print the reply, or report the failure."""
     try:
         result, save_warning = session.send(text, reply_fn)
-    except OpenAIProviderError as error:
+    except ProviderError as error:
         print(f"error: {error}", file=stderr)
         return
     except KeyboardInterrupt:

@@ -63,3 +63,62 @@ class FakeScreen:
             if x >= 0:
                 return self.attrs[y][x]
         raise AssertionError(f"{needle!r} not on screen")
+
+
+QWEN_TAG = {
+    "name": "qwen3.5:4b",
+    "model": "qwen3.5:4b",
+    "details": {"parameter_size": "4.2B", "quantization_level": "Q4_K_M"},
+    "capabilities": ["completion", "vision", "tools", "thinking"],
+}
+CLOUD_TAG = {
+    "name": "glm-4.7:cloud",
+    "model": "glm-4.7:cloud",
+    "remote_model": "glm-4.7",
+    "remote_host": "https://ollama.com:443",
+    "capabilities": ["completion", "tools", "thinking"],
+}
+
+
+class FakeOllama:
+    """Stands in for the Ollama HTTP API; records every request."""
+
+    def __init__(
+        self,
+        models: list[dict] | None = None,
+        replies: Iterable[object] = (),
+        show: dict[str, list[str]] | None = None,
+    ) -> None:
+        self.models = [QWEN_TAG, CLOUD_TAG] if models is None else models
+        self.replies = iter(replies)
+        self.show = show or {}
+        self.requests: list[tuple[str, str, dict | None, float]] = []
+
+    @property
+    def paths(self) -> list[str]:
+        return [path for _, path, _, _ in self.requests]
+
+    @property
+    def chat_payloads(self) -> list[dict]:
+        return [payload for _, path, payload, _ in self.requests if path == "/api/chat"]
+
+    def __call__(self, method: str, url: str, payload: dict | None, timeout: float) -> object:
+        path = "/" + url.split("/", 3)[3]
+        self.requests.append((method, path, payload, timeout))
+        if path == "/api/tags":
+            return {"models": self.models}
+        if path == "/api/show":
+            return {"capabilities": self.show.get(payload["model"], ["completion"])}
+        if path == "/api/chat":
+            reply = next(self.replies, None)
+            if isinstance(reply, BaseException):
+                raise reply
+            if reply is None:
+                count = len(self.chat_payloads)
+                reply = {
+                    "message": {"role": "assistant", "content": f"local reply {count}"},
+                    "prompt_eval_count": 10,
+                    "eval_count": 5,
+                }
+            return reply
+        raise AssertionError(f"unexpected request {method} {path}")

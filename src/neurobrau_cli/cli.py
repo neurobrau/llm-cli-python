@@ -1,7 +1,6 @@
 """Command-line entry point for NeuroBräu CLI."""
 
 import argparse
-import functools
 import os
 import sys
 from collections.abc import Sequence
@@ -9,14 +8,17 @@ from types import ModuleType
 from typing import TextIO
 
 from neurobrau_cli import __version__, chat
+from neurobrau_cli.conversation import Message
+from neurobrau_cli.engine import ChatEngine
 from neurobrau_cli.formatting import format_transcript, format_usage
-from neurobrau_cli.providers import openai_provider
-from neurobrau_cli.providers.openai_provider import ErrorKind, OpenAIProviderError
+from neurobrau_cli.providers import ollama_provider, openai_provider
+from neurobrau_cli.providers.base import ErrorKind, GenerationOptions, Provider, ProviderError
 from neurobrau_cli.session import ChatSession
 from neurobrau_cli.storage import HistoryStore, default_history_dir
 
 PROG_NAME = "neurobrau"
-PROVIDERS = ("openai",)
+PROVIDERS = ("openai", "ollama")
+DEFAULT_PROVIDER = "openai"
 
 EXIT_OK = 0
 EXIT_API_ERROR = 1
@@ -66,14 +68,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         choices=PROVIDERS,
-        default="openai",
-        help="LLM provider (default: %(default)s)",
+        help=(
+            f"LLM provider (default: {DEFAULT_PROVIDER}; an interactive chat without "
+            "--provider/--model continues with the provider of the last conversation)"
+        ),
     )
     parser.add_argument(
         "--model",
-        default=openai_provider.DEFAULT_MODEL,
         metavar="MODEL_ID",
-        help="model identifier (default: %(default)s)",
+        help=(
+            f"model identifier (default: {openai_provider.DEFAULT_MODEL} for openai, "
+            "the most recently installed local model for ollama)"
+        ),
     )
     parser.add_argument(
         "--reasoning-effort",
@@ -111,18 +117,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def create_providers() -> dict[str, Provider]:
+    """One instance per provider. Nothing connects until a provider is used."""
+    return {
+        "openai": openai_provider.OpenAIProvider(),
+        "ollama": ollama_provider.OllamaProvider(),
+    }
+
+
+def report(error: ProviderError, stderr: TextIO) -> int:
+    print(f"{PROG_NAME}: error: {error}", file=stderr)
+    return EXIT_CODES[error.kind]
+
+
 def run_prompt(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
     """Send the prompt to the provider and print the result."""
+    provider_name = args.provider or DEFAULT_PROVIDER
     try:
-        result = openai_provider.generate_text(
-            prompt=args.prompt,
-            model=args.model,
-            reasoning_effort=args.reasoning_effort,
-            max_output_tokens=args.max_output_tokens,
-        )
-    except OpenAIProviderError as error:
-        print(f"{PROG_NAME}: error: {error}", file=stderr)
-        return EXIT_CODES[error.kind]
+        if provider_name == "openai":
+            result = openai_provider.generate_text(
+                prompt=args.prompt,
+                model=args.model or openai_provider.DEFAULT_MODEL,
+                reasoning_effort=args.reasoning_effort,
+                max_output_tokens=args.max_output_tokens,
+            )
+        else:
+            provider = create_providers()[provider_name]
+            options = GenerationOptions(
+                model=args.model or provider.default_model(),
+                reasoning_effort=args.reasoning_effort,
+                max_output_tokens=args.max_output_tokens,
+            )
+            result = provider.generate([Message("user", args.prompt)], options)
+    except ProviderError as error:
+        return report(error, stderr)
 
     print(result.text, file=stdout)
     if args.usage:
@@ -132,48 +160,57 @@ def run_prompt(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
 
 def run_interactive(args: argparse.Namespace) -> int:
     """Start an interactive chat session with the configured model."""
+    session = open_session(args)
+    provider_name = args.provider or session.provider or DEFAULT_PROVIDER
+    providers = create_providers()
     try:
-        client = openai_provider.create_client()
-    except OpenAIProviderError as error:
-        print(f"{PROG_NAME}: error: {error}", file=sys.stderr)
-        return EXIT_CODES[error.kind]
+        if provider_name == "openai":
+            # Check the API key now rather than at the first message.
+            providers["openai"] = openai_provider.OpenAIProvider(openai_provider.create_client())
+        model = args.model or session.model or providers[provider_name].default_model()
+    except ProviderError as error:
+        return report(error, sys.stderr)
+    session.provider, session.model = provider_name, model
 
-    reply_fn = functools.partial(
-        openai_provider.generate_reply,
-        model=args.model,
-        reasoning_effort=args.reasoning_effort,
-        max_output_tokens=args.max_output_tokens,
-        client=client,
+    engine = ChatEngine(
+        providers, provider_name, model, args.reasoning_effort, args.max_output_tokens
     )
     settings = chat.ChatSettings(
-        provider=args.provider, model=args.model, show_usage=args.usage
+        provider=provider_name,
+        model=model,
+        show_usage=args.usage,
+        reasoning_effort=args.reasoning_effort,
+        max_output_tokens=args.max_output_tokens,
     )
-    session = open_session(args.no_history)
     if not args.plain and is_fullscreen_terminal():
         tui = load_tui()
         if tui is not None:
-            exit_code = tui.run_tui(settings, reply_fn, session)
+            exit_code = tui.run_tui(settings, engine.reply, session, engine=engine)
             # curses has restored the terminal by now, so this is normal output.
             if args.transcript_on_exit and session.messages:
                 print(format_transcript(session.messages))
             return exit_code
     chat.enable_line_editing()
-    return chat.run_chat(settings, reply_fn, input_fn=input, session=session)
+    return chat.run_chat(settings, engine.reply, input_fn=input, session=session)
 
 
-def open_session(no_history: bool) -> ChatSession:
-    """Restore the latest saved conversation unless history is disabled."""
-    if no_history:
-        return ChatSession()
+def open_session(args: argparse.Namespace) -> ChatSession:
+    """Restore the latest saved conversation for the requested provider/model.
+
+    Without --provider and --model, the most recent conversation of any
+    provider is continued with its own provider and model.
+    """
+    if args.no_history:
+        return ChatSession(provider=args.provider, model=args.model)
     try:
         directory = default_history_dir()
     except RuntimeError:  # home directory cannot be determined
-        session = ChatSession()
+        session = ChatSession(provider=args.provider, model=args.model)
         session.startup_warnings.append(
             "Cannot determine the home directory; conversation history is disabled."
         )
         return session
-    return ChatSession.restore(HistoryStore(directory))
+    return ChatSession.restore(HistoryStore(directory), provider=args.provider, model=args.model)
 
 
 def is_fullscreen_terminal() -> bool:

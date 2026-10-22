@@ -8,6 +8,8 @@ import pytest
 
 from neurobrau_cli.chat import EXIT_INTERRUPTED, ChatSettings
 from neurobrau_cli.conversation import Message
+from neurobrau_cli.engine import ChatEngine
+from neurobrau_cli.providers.base import Availability, ModelInfo, ProviderError
 from neurobrau_cli.providers.openai_provider import (
     ErrorKind,
     GenerationResult,
@@ -332,11 +334,12 @@ def test_long_ai_response_is_wrapped_with_hanging_indent() -> None:
 
     app.run()
 
-    lines = [line for line in screen.lines()[1:19] if "word" in line]
+    limit = app.layout().conversation_limit  # the settings panel starts after this column
+    lines = [line[: limit + 2] for line in screen.lines()[1:19] if "word" in line]
     assert len(lines) > 3
     assert lines[0].startswith("| AI > word0 ")
     assert all(line.startswith("|      word") for line in lines[1:])
-    assert all(line.endswith("|") for line in lines)
+    assert all(line.endswith(" |") for line in lines)
     words = " ".join(line[2:-1].replace("AI > ", "").strip() for line in lines).split()
     assert words == long_text.split()
 
@@ -494,7 +497,9 @@ def test_reset_preserves_previous_session_on_disk(store: HistoryStore) -> None:
     app.run()
 
     assert len(store.list_paths()) == 2
-    assert "The previous one stays saved." in screen.text()
+    assert app.state.entries == [
+        Entry("info", "Started a new conversation. The previous one stays saved.")
+    ]
     assert "Old" not in screen.text()
     assert ChatSession.restore(store).messages == ()
 
@@ -568,3 +573,298 @@ def test_save_failure_is_shown_after_reply(tmp_path: Path) -> None:
 
     assert "AI > reply 1" in screen.text()
     assert "Warning: Could not save" in screen.text()
+
+
+# ----- LLM SETTINGS panel, F2/F3 menus, provider switching -----
+
+
+class FakeProvider:
+    """Provider double with scripted models and availability."""
+
+    def __init__(
+        self,
+        name: str,
+        label: str,
+        models: list[str] | Exception = (),
+        available: bool = True,
+        on_list: object = None,
+    ) -> None:
+        self.name, self.label = name, label
+        self.models = models
+        self.available = available
+        self.on_list = on_list
+        self.calls: list[list[Message]] = []
+        self.list_calls = 0
+
+    def generate(self, messages: Sequence[Message], options: object) -> GenerationResult:
+        self.calls.append(list(messages))
+        return GenerationResult(f"{self.label} says hi", TokenUsage(1, 2, 3))
+
+    def list_models(self, refresh: bool = False) -> list[ModelInfo]:
+        self.list_calls += 1
+        if callable(self.on_list):
+            self.on_list()
+        if isinstance(self.models, Exception):
+            raise self.models
+        return [ModelInfo(model_id, details="1B") for model_id in self.models]
+
+    def check_availability(self) -> Availability:
+        return Availability(self.available, "" if self.available else f"{self.label} is down")
+
+    def default_model(self) -> str:
+        return self.models[0]
+
+
+def make_engine_app(
+    keys: Iterable[str | int] = (),
+    openai_models: list[str] | Exception = ("gpt-a", "gpt-b"),
+    ollama: FakeProvider | None = None,
+    store: HistoryStore | None = None,
+    cols: int = 80,
+) -> tuple[TuiApp, FakeScreen, ChatEngine]:
+    providers = {
+        "openai": FakeProvider("openai", "OpenAI", list(openai_models)
+                               if not isinstance(openai_models, Exception) else openai_models),
+        "ollama": ollama or FakeProvider("ollama", "Ollama", ["qwen3.5:4b", "llama3.2:3b"]),
+    }
+    engine = ChatEngine(providers, "openai", "gpt-a", "none", None)
+    settings = ChatSettings("openai", "gpt-a", reasoning_effort="none")
+    session = ChatSession.restore(store, provider="openai", model="gpt-a")
+    screen = FakeScreen(25, cols, keys)
+    app = TuiApp(screen, settings, engine.reply, STYLES, session, engine)
+    return app, screen, engine
+
+
+def menu_frame(screen: FakeScreen) -> list[str]:
+    """The last drawn frame that showed a menu."""
+    return next(frame for frame in reversed(screen.snapshots) if "+-[ SELECT" in "".join(frame))
+
+
+def panel_text(screen: FakeScreen) -> list[str]:
+    return [line[60:78].rstrip() for line in screen.lines()[1:19]]
+
+
+def test_settings_panel_shows_selection_and_usage() -> None:
+    app, screen, _ = make_engine_app(keys_for("Hi"))
+
+    app.run()
+
+    assert screen.lines()[0].endswith("+-[ LLM SETTINGS ]---+")
+    assert panel_text(screen)[:13] == [
+        "F2 MODEL", " gpt-a",
+        "F3 PROVIDER", " OpenAI",
+        "F4 REASONING", " none",
+        "F5 MAX TOKENS", " default",
+        "F6 ANSWER STYLE", " default",
+        "TOKENS", " in 1 out 2", " total 3",
+    ]
+    assert screen.attr_at("F2 MODEL") == STYLES.border
+    assert screen.lines()[19][58] == "+"  # panel separator joins the status border
+
+
+def test_settings_panel_clips_long_model_names() -> None:
+    app, screen, _ = make_app()
+    app.settings = ChatSettings("openai", "gpt-6-luna-2026-10-01-preview")
+    app.render()
+
+    assert " gpt-6-luna-2026-~" in panel_text(screen)  # 18 columns, cut marked with ~
+
+
+def test_settings_panel_is_hidden_on_narrow_terminals() -> None:
+    app, screen, _ = make_engine_app(cols=63)
+    app.render()
+
+    assert "LLM SETTINGS" not in screen.text()
+    assert app.layout().conversation_width == 63 - 4
+
+
+def test_f3_menu_lists_providers_with_current_highlighted() -> None:
+    app, screen, _ = make_engine_app([curses.KEY_F3])
+
+    app.run()
+
+    menu_rows = [line for line in menu_frame(screen) if "OpenAI" in line or "Ollama" in line]
+    assert any("[ SELECT PROVIDER ]" in line for line in menu_frame(screen))
+    assert any("| * OpenAI" in line for line in menu_rows)
+    assert any("|   Ollama" in line for line in menu_rows)
+    app.handle_key(curses.KEY_F3)
+    app.render()
+    assert screen.attr_at("* OpenAI") == STYLES.selected
+
+
+def test_switching_provider_starts_new_conversation_without_history() -> None:
+    keys = [*keys_for("Secret"), curses.KEY_F3, curses.KEY_DOWN, "\n", *keys_for("Hello")]
+    app, screen, engine = make_engine_app(keys)
+
+    app.run()
+
+    openai, ollama = engine.providers["openai"], engine.providers["ollama"]
+    assert openai.calls == [[Message("user", "Secret")]]
+    assert ollama.calls == [[Message("user", "Hello")]]  # nothing forwarded
+    assert (engine.provider, engine.model) == ("ollama", "qwen3.5:4b")
+    assert (app.settings.provider, app.settings.model) == ("ollama", "qwen3.5:4b")
+    assert (app.session.provider, app.session.model) == ("ollama", "qwen3.5:4b")
+    text = screen.text()
+    assert "Secret" not in text
+    assert " Ollama" in panel_text(screen)
+    assert "Provider: ollama  Model: qwen3.5:4b" in text
+
+
+def test_switch_keeps_previous_conversation_on_disk(store: HistoryStore) -> None:
+    keys = [*keys_for("Secret"), curses.KEY_F3, curses.KEY_DOWN, "\n"]
+    app, _, _ = make_engine_app(keys, store=store)
+
+    app.run()
+
+    assert len(store.list_paths()) == 2
+    assert ChatSession.restore(store, provider="openai").messages[0] == Message("user", "Secret")
+    assert ChatSession.restore(store).provider == "ollama"
+    assert app.state.entries[0].text.endswith("the previous one stays saved.")
+
+
+def test_unavailable_provider_is_not_selected() -> None:
+    down = FakeProvider("ollama", "Ollama", ["qwen3.5:4b"], available=False)
+    app, screen, engine = make_engine_app([curses.KEY_F3, curses.KEY_DOWN, "\n"], ollama=down)
+
+    app.run()
+
+    assert engine.provider == "openai"
+    assert "Ollama is not available: Ollama is down" in screen.text()
+
+
+def test_selecting_current_provider_changes_nothing() -> None:
+    app, _, engine = make_engine_app([*keys_for("Keep"), curses.KEY_F3, "\n"])
+
+    app.run()
+
+    assert engine.provider == "openai"
+    assert len(app.session.messages) == 2
+
+
+def test_f2_lists_models_and_switches_model() -> None:
+    keys = [*keys_for("Old"), curses.KEY_F2, curses.KEY_END, "\n", *keys_for("New")]
+    app, screen, engine = make_engine_app(keys)
+
+    app.run()
+
+    assert engine.model == "gpt-b"
+    assert engine.providers["openai"].calls[-1] == [Message("user", "New")]
+    assert " gpt-b" in panel_text(screen)
+
+
+def test_f2_menu_marks_current_model_and_shows_details() -> None:
+    app, screen, _ = make_engine_app([curses.KEY_F2])
+
+    app.run()
+
+    menu = "\n".join(menu_frame(screen))
+    assert "[ SELECT OPENAI MODEL ]" in menu
+    assert "* gpt-a" in menu and "1B" in menu
+    assert "1/2 Enter=OK Esc=cancel" in menu
+
+
+def test_escape_closes_menu_without_changes() -> None:
+    app, screen, engine = make_engine_app([curses.KEY_F2, curses.KEY_DOWN, "\x1b"])
+
+    app.run()
+
+    assert engine.model == "gpt-a"
+    assert app.state.menu is None
+    assert "SELECT" not in screen.text()
+
+
+def test_menu_keys_do_not_reach_input_line() -> None:
+    app, _, engine = make_engine_app([curses.KEY_F2, "x", "y", "\x1b"])
+
+    app.run()
+
+    assert app.state.input_text == ""
+    assert engine.providers["openai"].calls == []
+
+
+def test_long_menu_scrolls_and_counts() -> None:
+    models = [f"model-{i:02d}" for i in range(40)]
+    app, screen, engine = make_engine_app([curses.KEY_F2, curses.KEY_NPAGE, curses.KEY_NPAGE],
+                                          openai_models=models)
+    app.run()
+
+    menu = "\n".join(menu_frame(screen))
+    visible = app.menu_visible_items()
+    assert visible == 16
+    assert f"{2 * (visible - 1) + 1}/40" in menu
+    assert "model-30" in menu and "model-00" not in menu
+
+
+def test_model_discovery_failure_is_reported() -> None:
+    failure = ProviderError("Could not connect to OpenAI.", ErrorKind.CONNECTION)
+    app, screen, engine = make_engine_app([curses.KEY_F2], openai_models=failure)
+
+    app.run()
+
+    assert app.state.menu is None
+    assert "Error: Could not connect to OpenAI." in screen.text()
+    assert engine.model == "gpt-a"
+
+
+def test_empty_model_list_is_reported() -> None:
+    app, screen, _ = make_engine_app([curses.KEY_F2], openai_models=[])
+
+    app.run()
+
+    assert "No selectable OpenAI models were found." in screen.text()
+
+
+def test_busy_indicator_during_discovery() -> None:
+    seen: list[tuple[list[str], int]] = []
+
+    def record() -> None:
+        seen.append((screen.snapshots[-1], screen.attr_at("[LOADING")))
+
+    ollama = FakeProvider("ollama", "Ollama", ["q"], on_list=record)
+    app, screen, engine = make_engine_app([curses.KEY_F3, curses.KEY_DOWN, "\n", curses.KEY_F2],
+                                          ollama=ollama)
+    app.run()
+
+    snapshot, attr = seen[0]
+    assert any("[LOADING OLLAMA MODELS...]" in line for line in snapshot)
+    assert attr == STYLES.waiting
+    assert any("[READY]" in line for line in screen.snapshots[-1])
+
+
+def test_ctrl_d_closes_menu_then_exits() -> None:
+    app, _, _ = make_engine_app([curses.KEY_F2, tui.CTRL_D])
+
+    assert app.run() == 0
+    assert app.state.menu is None
+
+
+def test_ctrl_c_during_discovery_cancels() -> None:
+    def interrupt() -> None:
+        raise KeyboardInterrupt
+
+    ollama = FakeProvider("ollama", "Ollama", ["q"], on_list=interrupt)
+    app, screen, engine = make_engine_app([curses.KEY_F3, curses.KEY_DOWN, "\n"], ollama=ollama)
+    ollama.check_availability = lambda: ollama.list_models() and Availability(True)
+
+    assert app.run() == 0
+    assert "Cancelled." in screen.text()
+    assert engine.provider == "openai"
+
+
+@pytest.mark.parametrize("key", [curses.KEY_F4, curses.KEY_F5, curses.KEY_F6])
+def test_display_only_keys_explain_themselves(key: int) -> None:
+    app, screen, engine = make_engine_app([key])
+
+    app.run()
+
+    assert "display-only" in screen.text()
+
+
+@pytest.mark.parametrize("key", [curses.KEY_F2, curses.KEY_F3])
+def test_menus_without_engine_are_unavailable(key: int) -> None:
+    app, screen, _ = make_app([key])
+
+    app.run()
+
+    assert "not available" in screen.text()
+    assert app.state.menu is None

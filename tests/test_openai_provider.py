@@ -8,6 +8,7 @@ import openai
 import pytest
 
 from neurobrau_cli.conversation import Message
+from neurobrau_cli.providers.base import GenerationOptions
 from neurobrau_cli.providers import openai_provider
 from neurobrau_cli.providers.openai_provider import (
     ErrorKind,
@@ -188,3 +189,126 @@ def test_authentication_error_message_does_not_echo_server_text() -> None:
     message = str(openai_provider.translate_error(error))
 
     assert "sk-" not in message
+
+
+# ----- OpenAIProvider: discovery, availability, reasoning fallback -----
+
+
+def make_models_client(ids: list[str] | Exception) -> MagicMock:
+    client = MagicMock()
+    listing = client.with_options.return_value.models.list
+    if isinstance(ids, Exception):
+        listing.side_effect = ids
+    else:
+        listing.return_value = [SimpleNamespace(id=model_id) for model_id in ids]
+    return client
+
+
+def test_list_models_uses_models_api_with_bounded_timeout() -> None:
+    client = make_models_client(["gpt-b", "gpt-a", "text-embedding-3-small", "tts-1", "whisper-1"])
+    provider = openai_provider.OpenAIProvider(client)
+
+    models = provider.list_models()
+
+    assert [model.id for model in models] == ["gpt-a", "gpt-b"]
+    client.with_options.assert_called_once_with(max_retries=0)
+    client.with_options.return_value.models.list.assert_called_once_with(
+        timeout=openai_provider.DISCOVERY_TIMEOUT
+    )
+
+
+def test_list_models_is_cached_until_refresh() -> None:
+    client = make_models_client(["gpt-a"])
+    provider = openai_provider.OpenAIProvider(client)
+
+    provider.list_models()
+    provider.list_models()
+    provider.list_models(refresh=True)
+
+    assert client.with_options.return_value.models.list.call_count == 2
+
+
+def test_list_models_translates_errors() -> None:
+    client = make_models_client(openai.APIConnectionError(request=REQUEST))
+
+    with pytest.raises(OpenAIProviderError) as exc_info:
+        openai_provider.OpenAIProvider(client).list_models()
+
+    assert exc_info.value.kind is ErrorKind.CONNECTION
+
+
+def test_availability_without_api_key_makes_no_request() -> None:
+    availability = openai_provider.OpenAIProvider().check_availability()
+
+    assert not availability.available
+    assert "OPENAI_API_KEY is not set" in availability.message
+
+
+def test_availability_with_working_api() -> None:
+    provider = openai_provider.OpenAIProvider(make_models_client(["gpt-a"]))
+
+    assert provider.check_availability().available
+
+
+def test_availability_reports_authentication_failure() -> None:
+    error = make_status_error(openai.AuthenticationError, 401, "bad key")
+    provider = openai_provider.OpenAIProvider(make_models_client(error))
+
+    availability = provider.check_availability()
+
+    assert not availability.available
+    assert "authentication failed" in availability.message
+
+
+def test_provider_generate_sends_history_and_options() -> None:
+    client = make_client("Fine.")
+    provider = openai_provider.OpenAIProvider(client)
+
+    result = provider.generate(
+        [Message("user", "Hi")], GenerationOptions("gpt-x", "low", 32)
+    )
+
+    assert result.text == "Fine."
+    client.responses.create.assert_called_once_with(
+        model="gpt-x",
+        input=[{"role": "user", "content": "Hi"}],
+        reasoning={"effort": "low"},
+        store=False,
+        max_output_tokens=32,
+    )
+
+
+def test_model_rejecting_reasoning_is_retried_without_it_and_remembered() -> None:
+    rejection = make_status_error(openai.BadRequestError, 400, "Unsupported parameter")
+    rejection.param = "reasoning.effort"
+    client = make_client("Answer")
+    client.responses.create.side_effect = [rejection, client.responses.create.return_value,
+                                           client.responses.create.return_value]
+    provider = openai_provider.OpenAIProvider(client)
+    options = GenerationOptions("gpt-classic", "none")
+
+    assert provider.generate([Message("user", "Hi")], options).text == "Answer"
+    provider.generate([Message("user", "Again")], options)
+
+    calls = client.responses.create.call_args_list
+    assert "reasoning" in calls[0].kwargs
+    assert "reasoning" not in calls[1].kwargs
+    assert "reasoning" not in calls[2].kwargs  # remembered: no second failed attempt
+
+
+def test_other_bad_requests_are_not_retried() -> None:
+    rejection = make_status_error(openai.BadRequestError, 400, "context too long")
+    rejection.param = "input"
+    client = make_client()
+    client.responses.create.side_effect = rejection
+
+    with pytest.raises(OpenAIProviderError, match="context too long"):
+        openai_provider.OpenAIProvider(client).generate(
+            [Message("user", "Hi")], GenerationOptions("gpt-x", "none")
+        )
+
+    assert client.responses.create.call_count == 1
+
+
+def test_provider_default_model() -> None:
+    assert openai_provider.OpenAIProvider().default_model() == "gpt-6-luna"
