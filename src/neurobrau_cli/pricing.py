@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 
 from neurobrau_cli.providers.base import TokenUsage
+from neurobrau_cli.providers.ollama_provider import is_cloud_name
 from neurobrau_cli.usage import UsageRecord
 
 PRICING_VERSION = "2026-10-22"
@@ -90,15 +91,10 @@ def pricing_for(model: str) -> ModelPricing | None:
     return CATALOG.get(model) or CATALOG.get(SNAPSHOT_SUFFIX.sub("", model))
 
 
-def is_cloud_model(model: str) -> bool:
-    tag = model.rpartition(":")[2]
-    return tag == "cloud" or tag.endswith("-cloud")
-
-
 def estimate(record: UsageRecord) -> CostEstimate:
     """ESTIMATED cost of one request."""
     if record.provider == "ollama":
-        if is_cloud_model(record.model):
+        if is_cloud_name(record.model):
             return CostEstimate(UNAVAILABLE, notes=(f"{record.model} is an Ollama cloud model",))
         return CostEstimate(FREE_LOCAL, Decimal(0))
     if record.provider != "openai":

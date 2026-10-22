@@ -929,7 +929,7 @@ def test_f4_with_unknown_support_offers_only_default() -> None:
     app.run()
 
     menu = "\n".join(menu_frame(screen))
-    assert "Default (support unknown)" in menu
+    assert "Model default (support unknown)" in menu
     assert "1/1" in menu
     assert any("not confirmed" in entry.text for entry in app.state.entries)
 
@@ -952,9 +952,9 @@ def test_f4_default_choice_for_effort_models() -> None:
     app.run()
 
     menu = "\n".join(menu_frame(screen))
-    assert "Default" in menu and "Low" in menu and "High" in menu
+    assert "Model default" in menu and "Low" in menu and "High" in menu
     assert (engine.reasoning_effort, engine.reasoning_explicit) == (None, False)
-    assert " default" in panel_text(screen)
+    assert " model default" in panel_text(screen)
 
 
 def test_f5_presets_custom_and_limits() -> None:

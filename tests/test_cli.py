@@ -62,13 +62,13 @@ def test_version_prints_version_and_exits_successfully(
         main(["--version"])
 
     assert exc_info.value.code == 0
-    assert capsys.readouterr().out.strip() == "neurobrau 0.2.0"
+    assert capsys.readouterr().out.strip() == "neurobrau 0.3.0"
 
 
 def test_installed_metadata_matches_the_single_version_source() -> None:
     import importlib.metadata
 
-    assert __version__ == "0.2.0"
+    assert __version__ == "0.3.0"
     assert importlib.metadata.version("neurobrau-llm-cli") == __version__
 
 

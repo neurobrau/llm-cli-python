@@ -22,7 +22,12 @@ from neurobrau_cli.providers.base import (
     StreamIncomplete,
     TextDelta,
 )
-from neurobrau_cli.preferences import Overrides, Preferences, resolve_model_settings
+from neurobrau_cli.preferences import (
+    MODEL_DEFAULT,
+    Overrides,
+    Preferences,
+    resolve_model_settings,
+)
 from neurobrau_cli.session import ChatSession
 from neurobrau_cli.settings import (
     ANSWER_STYLES,
@@ -42,6 +47,7 @@ EXIT_API_ERROR = 1
 EXIT_USAGE_ERROR = 2  # argparse's own exit code for invalid arguments
 EXIT_INCOMPLETE = 8  # streamed answer stopped early (e.g. token limit)
 EXIT_INTERRUPTED = 130
+EXIT_BROKEN_PIPE = 141  # 128 + SIGPIPE, as shells report it
 EXIT_CODES: dict[ErrorKind, int] = {
     ErrorKind.API: EXIT_API_ERROR,
     ErrorKind.MISSING_API_KEY: 3,
@@ -102,11 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reasoning-effort",
-        choices=openai_provider.REASONING_EFFORTS,
+        choices=(*openai_provider.REASONING_EFFORTS, MODEL_DEFAULT),
         metavar="EFFORT",
         help=(
-            "reasoning effort: %(choices)s. Default: the saved choice for the model, "
-            "else none where the model supports it (Ollama: thinking off)"
+            "reasoning effort: %(choices)s. model-default sends no effort, so the model "
+            "uses its own default (gpt-6-luna: medium). Without this flag: the saved "
+            "choice for the model, else none where supported (Ollama: thinking off)"
         ),
     )
     parser.add_argument(
@@ -388,11 +395,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.prompt is None:
-        return run_interactive(args)
-    if not args.prompt.strip():
-        parser.error("prompt must not be empty")
-    return run_prompt(args, sys.stdout, sys.stderr)
+    try:
+        if args.prompt is None:
+            return run_interactive(args)
+        if not args.prompt.strip():
+            parser.error("prompt must not be empty")
+        return run_prompt(args, sys.stdout, sys.stderr)
+    except KeyboardInterrupt:
+        # Ctrl+C outside the places that handle it (e.g. a blocking one-shot
+        # request or model discovery at startup): no traceback.
+        print(f"\n{PROG_NAME}: interrupted", file=sys.stderr)
+        return EXIT_INTERRUPTED
+    except BrokenPipeError:
+        # Output piped into a command that stopped reading (e.g. `| head`).
+        # Point stdout at /dev/null so the interpreter's final flush stays quiet.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+        return EXIT_BROKEN_PIPE
 
 
 if __name__ == "__main__":

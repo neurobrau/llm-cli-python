@@ -19,6 +19,9 @@ from neurobrau_cli.settings import (
 
 # OpenAI-style effort names accepted by --reasoning-effort.
 EFFORT_ALIASES = {"none": "off", "off": "none"}
+# CLI value that sends no reasoning parameter, so the model uses its own default.
+# (NeuroBräu's own default, without any choice, is "none" where supported.)
+MODEL_DEFAULT = "model-default"
 
 
 @dataclass
@@ -40,7 +43,7 @@ class ModelSettings:
 def label(value: str | None) -> str:
     """Display name for a reasoning value."""
     if value is None:
-        return "Default"
+        return "Model default"
     return {"xhigh": "XHigh", "on": "On", "off": "Off"}.get(value, value.capitalize())
 
 
@@ -94,7 +97,17 @@ def resolve_model_settings(
 
     reasoning, explicit = None, False
     decided = False
-    if overrides.reasoning is not None:
+    if overrides.reasoning == MODEL_DEFAULT:
+        current = support()
+        if current.allows_default:
+            decided = True  # explicit "Model default": send no reasoning parameter
+        else:
+            message = (f"{model} has no model-default reasoning choice "
+                       f"({describe_support(model, current)})")
+            if strict:
+                raise SettingsError(message + ".")
+            notices.append(message + "; using the default.")
+    elif overrides.reasoning is not None:
         current = support()
         mapped = map_reasoning(current, overrides.reasoning) if current.known else overrides.reasoning
         if current.known and not current.values and overrides.reasoning in ("none", "off"):

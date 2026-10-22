@@ -714,7 +714,7 @@ def test_f4_menu_for_gpt_6_luna_shows_all_efforts_and_documented_default() -> No
 
     frame = next(f for f in reversed(screen.snapshots) if "Enter=OK" in "".join(f))
     menu = "\n".join(frame)
-    assert "Default" in menu and "model default: medium" in menu
+    assert "Model default" in menu and "no effort sent: medium" in menu
     labels = [label for label in ("None", "Low", "Medium", "High", "XHigh", "Max") if f"  {label}" in menu
               or f"* {label}" in menu]
     assert labels == ["None", "Low", "Medium", "High", "XHigh", "Max"]

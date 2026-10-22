@@ -228,5 +228,5 @@ def test_choosing_default_reasoning_is_saved_as_default(tmp_path: Path) -> None:
 
 def test_labels() -> None:
     assert [label(v) for v in (None, "off", "on", "xhigh", "low")] == [
-        "Default", "Off", "On", "XHigh", "Low"
+        "Model default", "Off", "On", "XHigh", "Low"
     ]

@@ -1,216 +1,251 @@
 # NeuroBräu CLI — Python
 
-Educational multi-provider LLM command-line client. Supports OpenAI (Responses
-API) and local models through [Ollama](https://ollama.com)'s native HTTP API.
+An educational multi-provider LLM client for the terminal: one-shot prompts,
+a line-oriented chat, and a fullscreen DOS-style interface. It talks to
+OpenAI (Responses API) and to local models through [Ollama](https://ollama.com).
 
-## Setup
+**Features**
+
+- OpenAI and local Ollama models; switch provider (F3) and model (F2) at runtime
+- One-shot prompts, plain chat and a fullscreen curses UI
+- Streaming output with Ctrl+C cancellation (`--stream`)
+- Persistent conversations, one per provider/model, restored after restarts
+- Reasoning effort, max output tokens and answer style per model (F4–F6)
+- Token accounting as reported by the API, with ESTIMATED costs
+- No credentials on disk: the OpenAI key is read from the environment only
+
+## Requirements
+
+- Linux (tested on Fedora 44); macOS should work but is untested
+- Python 3.14 or later
+- For OpenAI: an API key in `OPENAI_API_KEY`
+- For local models: Ollama running locally with at least one model installed
+
+## Installation
+
+From a built wheel (recommended; see [Building](#building)):
 
 ```bash
-python -m venv .venv
-.venv/bin/pip install -e '.[dev]'
-export OPENAI_API_KEY="..."   # read from the environment only; not needed for Ollama
+sudo dnf install python3 python3-pip      # Fedora 44 ships Python 3.14
+python3 -m venv ~/.local/share/neurobrau-venv
+~/.local/share/neurobrau-venv/bin/pip install neurobrau_llm_cli-0.3.0-py3-none-any.whl
+mkdir -p ~/.local/bin
+ln -s ~/.local/share/neurobrau-venv/bin/neurobrau ~/.local/bin/neurobrau
+neurobrau --version
 ```
 
-For Ollama, run the Ollama service locally (default `http://127.0.0.1:11434`,
-override with `OLLAMA_HOST`) and install a model yourself, e.g.
-`ollama pull qwen3.5:4b`. NeuroBräu never downloads models.
+From a source checkout (development):
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/neurobrau --version
+```
+
+`python -m neurobrau_cli` works as well.
+
+## Ollama setup
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh    # installs the ollama systemd service
+sudo systemctl enable --now ollama
+ollama pull qwen3.5:4b                            # NeuroBräu never downloads models
+neurobrau --provider ollama "Hello"
+```
+
+The default server is `http://127.0.0.1:11434`; set `OLLAMA_HOST` for another
+one. Only local models are used: cloud models that Ollama lists (such as
+`glm-4.7:cloud`) are never selected or contacted.
+
+## OpenAI configuration
+
+```bash
+export OPENAI_API_KEY="sk-..."        # e.g. in ~/.bashrc; never commit it
+neurobrau "What is a neural network?"
+```
+
+The key is read from the environment only and never written to any file.
+The default model is `gpt-6-luna`.
 
 ## Usage
 
-One-shot prompt:
+### One-shot
 
 ```bash
-neurobrau "What is a neural network?"
-neurobrau --model MODEL_ID --reasoning-effort low --max-output-tokens 200 --usage "Explain backprop"
-neurobrau --provider ollama --model qwen3.5:4b "Hello"
-neurobrau --provider ollama "Hello"     # first local model listed by Ollama
-neurobrau --answer-style brief "Explain recursion"
-neurobrau --provider ollama --stream "Explain neural networks."   # print text as it arrives
+neurobrau "Explain backpropagation"
+neurobrau --provider ollama --model qwen3.5:4b --stream "Explain neural networks"
+neurobrau --answer-style brief --max-output-tokens 300 --usage "Summarize TCP"
+neurobrau --reasoning-effort high "Prove that sqrt(2) is irrational"
 ```
 
-`--stream` prints the answer while it is generated, in one-shot mode, the
-`--plain` chat and the fullscreen UI. With `--usage`, token counts
-(and, for Ollama, durations) go to stderr after a complete answer. A
-streamed answer that stops early, e.g. at the token limit, is reported on
-stderr and exits with code 8. In the plain chat, only completed answers are
-added to the conversation; a cut-off, failed or Ctrl+C-cancelled answer is
-shown but not saved or sent as context. Ollama thinking is never printed.
+The answer goes to stdout, `--usage` statistics to stderr. Piping works:
+`neurobrau "List 10 primes" | head -n 3`.
 
-Interactive chat (no prompt argument; model options still apply):
+### Interactive
 
 ```bash
-neurobrau                  # fullscreen DOS-style UI in a terminal
-neurobrau --plain          # line-oriented chat
-neurobrau --model MODEL_ID --usage
-neurobrau --provider ollama
+neurobrau                    # fullscreen UI (when stdin and stdout are a terminal)
+neurobrau --stream           # ... with live streaming
+neurobrau --plain            # line-oriented chat
+neurobrau --provider ollama  # start with Ollama
 ```
 
-Without `--provider`/`--model`, an interactive chat continues with the
-provider and model that were active last time, and their conversation. In
-the fullscreen UI, the **LLM SETTINGS** panel shows the current selection;
-**F2** picks a model and **F3** a provider (OpenAI or Ollama) from DOS-style
-menus. Every provider/model combination keeps its own conversation:
-switching brings back that combination's most recent conversation (or starts
-an empty one), and messages are never sent to a different model. Switching
-back returns to where you left off, also after a restart.
+Without `--provider`/`--model`, the chat continues with the provider, model
+and conversation that were active last time.
 
-Generation settings change from the next message on and keep the conversation:
+### Options
 
-| Key | Setting | Choices |
-|---|---|---|
-| F4 | Reasoning | only values confirmed for the model: OpenAI efforts from a built-in table (unknown models: Default only); Ollama Off/On or named levels from `/api/show` |
-| F5 | Max output tokens | Default, 256, 512, 1024, 2048, 4096, Custom (validated against the model's limit when known) |
-| F6 | Answer style | Brief, Normal, Detailed (sent as a system/developer instruction, not stored in the conversation) |
-
-Ollama thinking output is kept out of the answer.
-
-## Token usage and estimated cost
-
-Each API request's usage is stored with its conversation exactly as the
-provider reports it: input, cached input, cache writes, output, reasoning
-and total tokens (nothing is estimated from text). The LLM SETTINGS panel
-shows the conversation totals, the input size of the latest request
-(`context`), and an **ESTIMATED** cost; `/usage` prints the full breakdown.
-Totals survive restarts. Because every request re-sends the whole history,
-billed input grows faster than the conversation itself.
-
-Costs are estimates, never billed amounts, calculated with `Decimal` from a
-small versioned catalog of official OpenAI prices (`src/neurobrau_cli/pricing.py`,
-version 2026-10-22; currently gpt-6-luna and gpt-5.1). Cached input, cache
-writes, long prompts (> 272K input tokens) and processing tiers (Flex,
-Batch, Fast) are priced when the API reports them. When the model, tier or
-required counts are unknown, the estimate is shown as qualified (`~`), a
-lower bound (`>=`) or `unavailable`, never invented. Local Ollama models
-cost `$0`; Ollama cloud models are never shown as free. Details:
-[docs/tui-spec.md](docs/tui-spec.md#15-token-accounting-and-estimated-cost).
-
-## Settings
-
-F4–F6 choices are saved in `$XDG_CONFIG_HOME/neurobrau/settings.json`
-(default `~/.config/neurobrau/settings.json`): reasoning and max tokens per
-provider/model, answer style globally. The file never contains API keys and
-is separate from conversation history. CLI flags (`--reasoning-effort`,
-`--max-output-tokens`, `--answer-style`) override saved values for one run
-and are not saved. A saved value the model does not support is ignored with
-a visible note. Format: [docs/tui-spec.md](docs/tui-spec.md#13-settings-file).
-
-The bottom bar of the fullscreen UI shows runtime state only: `READY`,
-`CONNECTING`, `GENERATING` (with elapsed time and `Ctrl+C Cancel`), `DONE`
-(Ollama: total, load and generation time and tokens/s from the API; OpenAI:
-client-observed latency), `CANCELLED`, `ERROR` and `WARNING`. Provider,
-model, settings and session token totals are in the LLM SETTINGS panel.
-With `--stream`, Ctrl+C cancels the answer being generated (it is not
-saved) and the chat continues.
-
-Ollama models are discovered via `/api/tags`. Cloud models that Ollama lists
-(e.g. `glm-4.7:cloud`) run on a remote service and are excluded from
-selection and never contacted; only local models are used.
-
-The fullscreen UI starts only when stdin and stdout are terminals; otherwise
-the line-oriented chat is used. Layout, colors and keys are specified in
-[docs/tui-spec.md](docs/tui-spec.md).
-
-Chat commands (backslash aliases such as `\help` also work):
-
-| Command | Effect |
+| Option | Effect |
 |---|---|
-| `/help` | list commands and keys |
-| `/reset` | start a new conversation; the previous one stays saved on disk |
-| `/cleanup` | delete **all** saved conversations after you type `yes` to confirm |
-| `/usage` | token usage and ESTIMATED cost of this conversation |
-| `/exit` | exit; the conversation stays saved |
+| `--provider openai\|ollama` | provider (default: openai, or the last one used) |
+| `--model ID` | model (default: `gpt-6-luna`; Ollama: most recently installed local model) |
+| `--reasoning-effort E` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `model-default` |
+| `--max-output-tokens N` | output limit for this run |
+| `--answer-style S` | `brief`, `normal` or `detailed` |
+| `--stream` | show text as it is generated (one-shot, plain chat and fullscreen) |
+| `--usage` | print token usage to stderr |
+| `--plain` | use the line-oriented chat |
+| `--no-history` | neither restore nor save conversations |
+| `--transcript-on-exit` | print the conversation after the fullscreen UI closes |
 
-Ctrl+D (on empty input) or Ctrl+C while idle exits; Ctrl+C while waiting for
-a response cancels that request. In the fullscreen UI, PgUp/PgDn and Up/Down
-scroll the conversation.
+Command-line options override saved settings for one run and are not saved.
 
-## Conversation history
+### Keyboard controls (fullscreen UI)
 
-Interactive chats are saved automatically and the most recently updated
-conversation is restored on the next launch (plain chat and fullscreen UI
-alike). One-shot prompts are never saved.
+| Key | Action |
+|---|---|
+| F1 | help |
+| F2 | choose model |
+| F3 | choose provider (OpenAI, Ollama) |
+| F4 | reasoning effort / thinking |
+| F5 | max output tokens (presets or custom) |
+| F6 | answer style (Brief, Normal, Detailed) |
+| Enter | send |
+| PgUp/PgDn, Up/Down | scroll the conversation |
+| Ctrl+C | cancel the running answer; when idle, quit |
+| Ctrl+D | quit (on empty input) |
+| Esc | close a menu or the custom-token prompt |
 
-- Location: `$XDG_STATE_HOME/neurobrau/conversations/`, or
-  `~/.local/state/neurobrau/conversations/` when `XDG_STATE_HOME` is unset.
-  One JSON file per conversation, named `<id>.json`.
-- **Stored locally in plaintext.** Anyone who can read these files can read
-  your conversations. Directories are created with mode `0700` and files with
-  `0600` where the OS supports it. API keys are never written.
-- Saved immediately after each successful response, by writing a temporary
-  file and atomically renaming it, so a crash or Ctrl+C never leaves a
-  half-written file. Failed or cancelled requests are not saved.
-- Unreadable or corrupt files are reported at startup, skipped, and left
-  untouched. Storage errors are reported as warnings; the chat keeps working.
-- The JSON format is provider-independent and shared with the Go and
-  TypeScript implementations; see
-  [docs/tui-spec.md](docs/tui-spec.md#11-conversation-storage).
+In menus: Up/Down, PgUp/PgDn, Home/End, Enter, Esc. F2 and F3 switch
+conversations; F4–F6 apply from the next message and keep the conversation.
 
-Flags:
+### Chat commands
+
+`/help`, `/reset` (new conversation; the old one stays saved), `/usage`
+(token usage and estimated cost), `/cleanup` (delete all saved conversations
+after typing `yes`), `/exit`. Backslash forms such as `\help` also work.
+
+### Reasoning defaults
+
+Without a saved or command-line choice, NeuroBräu sends reasoning effort
+`none` where the model supports it (Ollama: thinking off). **Model default**
+in F4, or `--reasoning-effort model-default`, sends no effort at all, so the
+model uses its own default: `medium` for gpt-6-luna. Only values confirmed
+for a model are offered; models whose support is unknown show only Model
+default.
+
+### Streaming and cancellation
+
+With `--stream`, text appears as it arrives. Ctrl+C cancels the answer: the
+partial text is shown but neither saved nor sent as context, and the chat
+continues. Only completed answers become part of a conversation. A streamed
+answer cut off by the token limit is reported (exit code 8 in one-shot mode).
+
+## Persistent conversations
+
+Interactive chats are saved after every completed answer and restored on the
+next start. Each provider/model combination keeps its own conversation;
+switching back with F2/F3 returns to it. One-shot prompts are not saved.
+Files are written atomically with owner-only permissions, and corrupt files
+are reported and skipped, never deleted.
+
+## Configuration and file locations
+
+| What | Location |
+|---|---|
+| Conversations | `$XDG_STATE_HOME/neurobrau/conversations/<id>.json` (default `~/.local/state/…`) |
+| Active provider/model | `$XDG_STATE_HOME/neurobrau/active.json` |
+| Settings (F4–F6 choices) | `$XDG_CONFIG_HOME/neurobrau/settings.json` (default `~/.config/…`) |
+| OpenAI key | `OPENAI_API_KEY` environment variable only |
+| Ollama server | `OLLAMA_HOST` (default `127.0.0.1:11434`) |
+
+Directories are `0700`, files `0600`. Conversations are stored **in
+plaintext**. The JSON formats are documented in
+[docs/tui-spec.md](docs/tui-spec.md) (sections 11, 13 and 15).
+
+## Usage and estimated pricing
+
+Token usage is stored exactly as the provider reports it (input, cached
+input, cache writes, output, reasoning, total) and shown in the LLM SETTINGS
+panel and by `/usage`. Every request re-sends the whole conversation, so
+billed input grows with each turn.
+
+Costs are **ESTIMATED**, never billed amounts. They use a small, versioned
+catalog of official OpenAI prices (`src/neurobrau_cli/pricing.py`, version
+2026-10-22: gpt-6-luna and gpt-5.1), including cached input, cache writes,
+long prompts and processing tiers. When the model, tier or a needed count is
+unknown, the estimate is marked `~` (qualified), `>=` (lower bound) or
+`unavailable`; nothing is invented. Local Ollama inference costs `$0`.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `OPENAI_API_KEY is not set` (exit 3) | `export OPENAI_API_KEY=...`, or use `--provider ollama` |
+| `Could not connect to Ollama` (exit 7) | `systemctl status ollama`; `sudo systemctl start ollama`; check `OLLAMA_HOST` |
+| `No local Ollama models are installed` | `ollama pull qwen3.5:4b` |
+| `... is an Ollama cloud model` | choose a local model (F2 or `--model`) |
+| F-keys or arrows type odd characters | make sure `TERM` matches your terminal (e.g. `xterm-256color`) |
+| No fullscreen UI | it needs a terminal on stdin and stdout; use `--plain` for pipes |
+| `Terminal too small` | resize to at least 40×12 (80×25 recommended) |
+| Settings ignored with a warning | the settings file is invalid; fix or delete it |
+| Cost shows `unavailable` | the model is not in the pricing catalog |
+
+Exit codes: 0 success, 1 API error, 2 invalid arguments, 3 missing API key,
+4 authentication failed, 5 rate limit, 6 timeout, 7 connection error,
+8 streamed answer incomplete, 130 interrupted, 141 output pipe closed.
+
+## Known limitations
+
+- Prices change: the pricing catalog covers only verified models and needs
+  updating with OpenAI's price list. Cancelled requests may be billed by the
+  provider but report no usage, so they are not counted.
+- OpenAI reasoning choices come from a small built-in capability table.
+- Ollama thinking is kept out of answers but not displayed.
+- A cancelled stream that is waiting on the network closes when data arrives
+  or the read times out (Ollama: 300 s).
+- Wide characters (CJK, emoji) may misalign in the fullscreen UI.
+- Two instances sharing the same history directory: the last save wins.
+- Conversation context is replayed as text; reasoning items and tool calls
+  are not replayed.
+
+## Development
 
 ```bash
-neurobrau --no-history            # neither restore nor save for this run
-neurobrau --transcript-on-exit    # print the conversation after the fullscreen UI closes
+.venv/bin/python -m pytest                      # no real network requests
 ```
-
-`--transcript-on-exit` applies to the fullscreen UI only (the plain chat is
-already in your scrollback). The transcript includes restored messages.
-
-## Exit codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | success |
-| 1 | other API error |
-| 2 | invalid arguments |
-| 3 | missing `OPENAI_API_KEY` |
-| 4 | authentication failed |
-| 5 | rate limit or quota exceeded |
-| 6 | timeout |
-| 7 | connection error |
-| 8 | streamed answer incomplete (`--stream`) |
-| 130 | chat interrupted with Ctrl+C |
-
-## Limitations
-
-- OpenAI's model list hides obvious non-text models by name; other listed
-  models may still be rejected by the Responses API (shown as an error).
-- The pricing catalog only covers models whose prices were verified on
-  OpenAI's official pages; prices change, so `PRICING_VERSION` must be
-  updated with them. Cancelled requests may still be billed by the provider
-  but report no usage, so they are not counted. Data-residency uplifts and
-  non-default cache retention are not modelled.
-- gpt-6-luna supports none, low, medium, high, xhigh and max; its documented
-  default is medium, but without a saved or CLI choice this app still sends
-  `none` (the project default since Task 002).
-- OpenAI reasoning choices come from a small built-in table
-  (`KNOWN_MODELS` in `providers/openai_provider.py`); other models offer
-  only Default in F4. A model that rejects a built-in default is retried
-  once without it; a value you chose is reported as an error instead.
-- Reasoning returned by Ollama is kept separate and currently not shown.
-- Discovery and availability checks block the UI briefly (bounded by 5 s for
-  OpenAI and 3 s for Ollama). Ollama chat requests time out after 300 s.
-- F-keys and arrows rely on the terminal matching its `TERM` setting; an
-  unrecognized escape sequence may be read as Esc followed by typed text.
-- Running two chats at once against the same history directory can lose
-  messages: both continue the same conversation and the last save wins.
-- Requests use `store=False`. Context is sent by replaying prior user and
-  assistant **text** messages. Full Responses API output-item replay
-  (reasoning items, tool calls) is not implemented yet.
-- No streaming yet.
-- The fullscreen UI counts one column per character; wide characters (CJK,
-  emoji) may misalign.
-
-## Version
 
 The version is defined once, as `__version__` in
-`src/neurobrau_cli/__init__.py`; `pyproject.toml` reads it at build time
-(`dynamic = ["version"]`). After changing it, reinstall
-(`.venv/bin/pip install -e '.[dev]'`) so the installed metadata matches.
+`src/neurobrau_cli/__init__.py`; `pyproject.toml` reads it at build time.
 
-## Tests
+### Building
 
 ```bash
-.venv/bin/python -m pytest
+python3 -m venv /tmp/build-tools && /tmp/build-tools/bin/pip install build
+/tmp/build-tools/bin/python -m build            # dist/*.whl and dist/*.tar.gz
 ```
 
-Tests mock the OpenAI SDK and never make real API calls.
+Optional standalone Linux executable (bundles Python and the dependencies;
+built and tested on Fedora 44, x86-64; needs a compatible glibc):
+
+```bash
+python3 -m venv /tmp/pyi && /tmp/pyi/bin/pip install dist/*.whl pyinstaller
+/tmp/pyi/bin/pyinstaller --onefile --name neurobrau \
+    /tmp/pyi/lib64/python3.14/site-packages/neurobrau_cli/__main__.py
+./dist/neurobrau --version
+```
+
+Build output (`dist/`, `build/`, `*.spec`) is git-ignored.
+
+The behaviour shared with the planned Go and TypeScript versions is specified
+in [docs/tui-spec.md](docs/tui-spec.md).

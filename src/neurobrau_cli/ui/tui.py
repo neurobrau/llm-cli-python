@@ -69,7 +69,7 @@ FLASH_SECONDS = 2.0  # a warning shown during a request outranks the live status
 
 USER_LABEL = "YOU > "
 AI_LABEL = "AI > "
-HELP_LINE = " /help /reset /exit | F2-F6 settings | PgUp/PgDn scroll | Ctrl+C quit"
+HELP_LINE = " F1 /help | /reset /exit | F2-F6 settings | PgUp/PgDn scroll | Ctrl+C quit"
 TOKENS_LABEL = "TOKENS > "
 STYLE_NOTES = {
     "brief": "short, concise answers",
@@ -83,7 +83,7 @@ HELP_TEXT = """Commands:
   /usage    token usage and ESTIMATED cost of this conversation
   /exit     exit the application (the conversation stays saved)
 Backslash aliases also work: \\help, \\reset, \\cleanup, \\usage, \\exit.
-Keys: Enter send, Backspace/Delete edit, Left/Right/Home/End move,
+Keys: F1 this help, Enter send, Backspace/Delete edit, Left/Right/Home/End move,
 Ctrl+U clear input, PgUp/PgDn/Up/Down scroll, Ctrl+D (empty input) or Ctrl+C quit.
 F2 model, F3 provider (both start a new conversation).
 F4 reasoning, F5 max output tokens, F6 answer style (keep the conversation;
@@ -401,6 +401,9 @@ class TuiApp:
             state.after_transient = None
         if state.menu is not None:
             self.handle_menu_key(key)
+        elif key == curses.KEY_F1:
+            self.add_entry("info", HELP_TEXT)  # also while streaming
+            state.scroll = 0
         elif self.request is not None and key in self.function_keys():
             self.flash(RuntimeStatus(rt.WARNING, ("Settings cannot change while a response is generated",)))
         elif self.request is not None and key == CTRL_D:
@@ -730,7 +733,7 @@ class TuiApp:
         if support is None:
             return
         if not support.known:
-            items = [MenuItem("Default (support unknown)", "", current=True)]
+            items = [MenuItem("Model default (support unknown)", "", current=True)]
             self.add_entry(
                 "info",
                 f"Reasoning support for {engine.model} is not confirmed, so only the "
@@ -740,9 +743,11 @@ class TuiApp:
             self.add_entry("info", f"{engine.model} does not support reasoning.")
             return
         else:
-            note = (f"model default: {support.model_default}" if support.model_default
-                    else "model default")
-            items = [MenuItem("Default", "", note)] if support.allows_default else []
+            # "Model default" omits the effort parameter, so the model decides; it is
+            # different from NeuroBräu's own default ("none" where supported).
+            note = (f"no effort sent: {support.model_default}" if support.model_default
+                    else "no effort sent")
+            items = [MenuItem("Model default", "", note)] if support.allows_default else []
             items += [MenuItem(label(value), value) for value in support.values]
             current = engine.reasoning_effort or ""
             items = [replace(item, current=item.value == current) for item in items]
@@ -787,7 +792,10 @@ class TuiApp:
         engine, prefs = self.engine, self.preferences
         if kind == "reasoning":
             warning = prefs.set_reasoning(engine, value or None)
-            self.add_entry("info", f"Reasoning for {engine.model}: {label(value or None)}. "
+            chosen = label(value or None)
+            if not value:
+                chosen += " (no effort parameter is sent)"
+            self.add_entry("info", f"Reasoning for {engine.model}: {chosen}. "
                                    "Applies from the next message.")
         elif kind == "max_tokens" and value == "custom":
             self.start_token_prompt()
@@ -1179,7 +1187,7 @@ def settings_panel_lines(
     rows = [
         ("F2 MODEL", "border"), value(settings.model),
         ("F3 PROVIDER", "border"), value(provider_label(settings.provider)),
-        ("F4 REASONING", "border"), value(settings.reasoning_effort or "default"),
+        ("F4 REASONING", "border"), value(settings.reasoning_effort or "model default"),
         ("F5 MAX TOKENS", "border"), value(str(max_tokens) if max_tokens else "default"),
         ("F6 ANSWER STYLE", "border"), value(settings.answer_style or "default"),
         ("TOKENS", "border"),

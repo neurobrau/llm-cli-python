@@ -1,9 +1,23 @@
 # NeuroBräu TUI Specification
 
-A minimal, retro DOS-style fullscreen chat interface. This document is the
-reference for the Python implementation (`src/neurobrau_cli/ui/tui.py`) and
-for future Go and TypeScript ports. Ports should match it character for
-character where practical.
+A minimal, retro DOS-style fullscreen chat interface and the behaviour around
+it. This document is the language-neutral reference for the Python
+implementation (version 0.3.0) and for future Go and TypeScript ports.
+
+* **Interoperable** (must match exactly, so implementations can share data):
+  the conversation, settings, active-selection and usage JSON formats
+  (sections 11, 13, 15), file locations, provider request mapping (12, 14)
+  and pricing rules (15).
+* **Behavioural** (should match character for character where practical):
+  layout, colors, keys, menus, messages and exit codes.
+* Text marked *Python:* describes how the reference implementation does
+  something; ports may use any mechanism with the same behaviour.
+
+Contents: 1 Start · 2 Layout · 3 Colors · 4 Conversation panel · 4a Settings
+panel · 4b Menus · 4c Generation settings · 5 Status bar · 6 Input · 7 Keys ·
+8 Input handling · 9 Exit · 10 Porting notes · 11 Conversation storage ·
+12 Providers · 13 Settings file · 14 Streaming · 15 Usage and cost ·
+16 Errors and exit codes.
 
 ## 1. When the TUI starts
 
@@ -65,7 +79,7 @@ row 20  | DONE | 7.17s total | load 0.20s | generation 1.88s | 15.96 tok/s      
 row 21  +-[ Input ]--------------------------------------------------------------------+
 row 22  | YOU >                                                                        |
 row 23  +------------------------------------------------------------------------------+
-row 24   /help /reset /exit | F2-F6 settings | PgUp/PgDn scroll | Ctrl+C quit
+row 24   F1 /help | /reset /exit | F2-F6 settings | PgUp/PgDn scroll | Ctrl+C quit
 ```
 
 For a terminal of `R` rows and `C` columns:
@@ -173,7 +187,7 @@ indented by one space and clipped to 18 columns with `~` marking a cut
 |---|---|---|
 | 1–2 | `F2 MODEL` | current model ID |
 | 3–4 | `F3 PROVIDER` | `OpenAI` or `Ollama` |
-| 5–6 | `F4 REASONING` | effective value in provider vocabulary (`none`, `low`, `off`, `on`, …) or `default` (no parameter sent) |
+| 5–6 | `F4 REASONING` | effective value in provider vocabulary (`none`, `low`, `off`, `on`, …) or `model default` (no parameter sent) |
 | 7–8 | `F5 MAX TOKENS` | effective limit or `default` |
 | 9–10 | `F6 ANSWER STYLE` | `brief`, `normal` or `detailed` |
 | 11 | `TOKENS` | |
@@ -275,12 +289,17 @@ Ollama: one cached `/api/show`). Items:
 
 | Support | Items |
 |---|---|
-| unknown (OpenAI model not in the table) | `Default (support unknown)` only, plus an info entry: `Reasoning support for <model> is not confirmed, so only the model's default is offered. --reasoning-effort sends a value explicitly.` |
+| unknown (OpenAI model not in the table) | `Model default (support unknown)` only, plus an info entry: `Reasoning support for <model> is not confirmed, so only the model's default is offered. --reasoning-effort sends a value explicitly.` |
 | none | no menu; info entry `<model> does not support reasoning.` |
-| values | `Default` (note `model default: <effort>` when the model's own default is documented, e.g. `medium` for gpt-6-luna, else `model default`; only where omitting the parameter is allowed) followed by the values with labels `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`, `Off`, `On` or the level name capitalized |
+| values | `Model default` (note `no effort sent: <effort>` when the model's own default is documented, e.g. `medium` for gpt-6-luna, else `no effort sent`; only where omitting the parameter is allowed) followed by the values with labels `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`, `Off`, `On` or the level name capitalized |
 
-`Default` sends no reasoning parameter. Ollama On/Off models offer no
-`Default`: thinking is always sent, `false` unless On is chosen.
+**Model default** sends no reasoning parameter, so the model applies its own
+default. It is not the same as **NeuroBräu's default** (what is sent when
+nothing was chosen: `none` where supported, section 13). Choosing it shows
+`Reasoning for <model>: Model default (no effort parameter is sent).
+Applies from the next message.` and is saved as `"default"`. Ollama On/Off
+models offer no Model default: thinking is always sent, `false` unless On is
+chosen.
 
 **F5 MAX OUTPUT TOKENS.** Shows `CONNECTING | Checking model limits` while reading
 the model's limit (OpenAI table; Ollama `context_length` from the cached
@@ -378,6 +397,7 @@ F-key while streaming) is shown over the live state for 2 seconds.
 | Ctrl+D | exit (only when the input line is empty) |
 | Ctrl+C (idle) | exit with code 130 |
 | Ctrl+C (request running) | cancel the request, keep running (streaming: section 14) |
+| F1 | append the help text (same as `/help`); works while a response streams |
 | F2 | model menu (section 4b) |
 | F3 | provider menu (section 4b) |
 | F4 | reasoning menu (section 4c) |
@@ -386,8 +406,11 @@ F-key while streaming) is shown over the live state for 2 seconds.
 | Esc | close the F5 custom-value prompt |
 
 Other keys are ignored, including Esc outside a menu or prompt. The help line reads
-` /help /reset /exit | F2-F6 settings | PgUp/PgDn scroll | Ctrl+C quit`.
-Esc is recognized after 25 ms (curses `set_escdelay`).
+` F1 /help | /reset /exit | F2-F6 settings | PgUp/PgDn scroll | Ctrl+C quit`.
+A lone Esc is recognized after about 25 ms, so the escape sequences of
+function and arrow keys are not mistaken for Esc (*Python:* curses
+`set_escdelay(25)`). F-keys and arrows are decoded from the terminal's
+`TERM` description.
 
 ## 8. Submitting input
 
@@ -445,8 +468,8 @@ Esc is recognized after 25 ms (curses `set_escdelay`).
 | Missing API key (before the TUI starts) | 3 |
 
 The terminal (alternate screen, echo, cursor mode, colors) is always
-restored on exit, including on exceptions; in Python this is guaranteed by
-`curses.wrapper`. No traceback is printed for Ctrl+C.
+restored on exit, including on unexpected errors (*Python:* `curses.wrapper`).
+Ctrl+C never prints a stack trace. Exit codes: section 16.
 
 With `--transcript-on-exit`, **after** the terminal is restored (so the text
 stays in the normal scrollback) and for every exit path above, the complete
@@ -471,8 +494,15 @@ conversation. Only committed messages appear (no errors or notices).
   from drawing so it can be tested with a fake screen.
 * Use one redraw-everything function per event; terminal libraries diff the
   output.
-* Python uses `textwrap`; ports must reproduce its behavior: greedy word
-  wrap, collapse nothing inside a line, break over-long words at the width.
+* Wrapping (section 4) is greedy word wrap: split each explicit line on
+  spaces, fill each output line with as many whole words as fit, never
+  hyphenate, break a word longer than the width at the width, drop spaces at
+  the start/end of wrapped lines, keep the line's leading indentation (capped
+  at half the width) on all its wrapped lines, expand tabs to 4 spaces
+  (*Python:* `textwrap.wrap`).
+* Streaming needs one background reader per request and a bounded hand-off
+  to the UI thread (section 14); any mechanism (threads, goroutines, async
+  tasks) works if all drawing stays on one thread.
 * Character widths are counted as one column per code point; wide (CJK,
   emoji) characters are a known limitation.
 
@@ -697,9 +727,15 @@ For the active provider/model, each setting is resolved in this order:
    ignored with a visible note, e.g.
    `Saved reasoning 'High' is not available for m (m supports reasoning: Off, On); using Off.`
    or `Saved setting ignored: 5000 exceeds the limit of 4096 output tokens for m. Using the default.`
-3. **Built-in default:** reasoning `none` where the model's confirmed efforts
-   include it (e.g. `gpt-6-luna`), Ollama `off` for thinking models,
-   otherwise no parameter; max tokens: model default; style: `normal`.
+3. **NeuroBräu's default:** reasoning `none` where the model's confirmed
+   efforts include it (e.g. `gpt-6-luna`, whose own default is `medium`),
+   Ollama `off` for thinking models, otherwise no parameter; max tokens:
+   model default; style: `normal`.
+
+`--reasoning-effort model-default` is the CLI form of F4's Model default: no
+parameter is sent. On a model without that choice (Ollama On/Off) it is an
+error at startup (exit 2): `<model> has no model-default reasoning choice
+(<model> supports reasoning: Off, On).`
 
 CLI effort names apply to Ollama too: `none` → `off`, any other effort → `on`
 on On/Off models, or the same-named level. Explicit values for OpenAI
@@ -838,10 +874,11 @@ error entry `Cancelled.` (plus ` The partial answer above was not saved.`
 if text was shown) is added, and the status shows `CANCELLED`. The partial
 text stays visible but is never committed or saved. The worker is told to
 stop; it notices after the next event arrives (or its read times out),
-closes the stream, which closes the HTTP connection, and exits. The SIGINT
-handler only records the request while a stream runs, so the cancellation
-happens at a safe point in the loop. When no stream is running, Ctrl+C
-behaves as before (exit, or interrupt a blocking call).
+closes the stream, which closes the HTTP connection, and exits. While a
+stream runs, the interrupt (Ctrl+C) only records the request and the UI
+loop cancels at its next iteration, never in the middle of a redraw or
+state update (*Python:* a SIGINT handler that sets a flag). When no stream
+is running, Ctrl+C behaves as before (exit, or interrupt a blocking call).
 
 **Limitation:** a read that is blocked waiting for the network cannot be
 interrupted from another thread. A cancelled stream closes when the next
@@ -849,8 +886,8 @@ data arrives or the provider's read timeout expires (Ollama: 300 s). Until
 then a new message waits up to 1 s and, if the old stream is still open,
 is refused with `WARNING | The cancelled response is still closing; try
 again shortly` (the typed text is kept). On exit the app waits at most
-0.5 s per stream; worker threads are daemons and never block exit. The
-terminal is restored by `curses.wrapper` on every exit path.
+0.5 s per stream; a reader that is still blocked never delays exit
+(*Python:* daemon threads). The terminal is restored on every exit path.
 
 ## 15. Token accounting and ESTIMATED cost
 
@@ -910,7 +947,8 @@ included; every other model is "unavailable".
 
 Tier multipliers: gpt-6-luna `default` 1, `flex` and `batch` 0.5, `fast`
 (formerly `priority`) 2; gpt-5.1 `default` only. Dated snapshots use their
-base model's prices. All calculations use decimal arithmetic.
+base model's prices. All calculations use exact decimal arithmetic, never
+binary floating point (*Python:* `Decimal`).
 
 ### Calculation
 
@@ -966,3 +1004,40 @@ local: `API cost: $0 (local Ollama inference)`; incomplete answers add
 
 The runtime status bar never shows token totals or cost; it keeps the
 timing metrics of section 5 (Ollama generation speed included).
+
+## 16. Errors and exit codes
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success (also `/exit`, Ctrl+D on empty input) |
+| 1 | API error (HTTP error, invalid response, unknown or cloud model, other provider failure) |
+| 2 | invalid arguments, or a CLI setting the model is known not to support |
+| 3 | `OPENAI_API_KEY` missing |
+| 4 | authentication failed |
+| 5 | rate limit or quota exceeded |
+| 6 | timeout |
+| 7 | connection failed (including an Ollama stream that ended early) |
+| 8 | streamed one-shot answer incomplete (e.g. token limit) |
+| 130 | interrupted (Ctrl+C when nothing can be cancelled) |
+| 141 | stdout closed by the reader (e.g. `| head`); exits quietly |
+
+Every provider failure carries one of the kinds missing API key,
+authentication, rate limit, timeout, connection or API, which select codes
+3–7 or 1.
+
+### Where errors appear
+
+| Mode | Errors | Warnings / notes |
+|---|---|---|
+| One-shot | stderr `neurobrau: error: <message>` | stderr `neurobrau: warning: …`, `neurobrau: note: …` |
+| Plain chat | stderr `error: <message>`; the chat continues | stderr `warning: …` |
+| Fullscreen | error entry `Error: <message>` and status `ERROR \| <message>` | error entry `Warning: …` and/or status `WARNING \| …` |
+| Startup (any mode) | missing key, unreachable Ollama without a model, unsupported CLI setting: message on stderr, exit before the UI starts | storage/settings problems become startup warnings; the app still starts |
+
+Messages never contain credentials. Authentication failures use a fixed text
+(`OpenAI authentication failed. Check that OPENAI_API_KEY is valid.`), not
+the server's message. Storage, settings and history problems are reported
+as warnings and never stop a chat; corrupt files are skipped and left
+unchanged.

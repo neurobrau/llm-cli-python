@@ -1,0 +1,5 @@
+# Files the sdist needs beyond the package: the README links to the spec,
+# and the test suite needs its shared fixtures and fakes.
+include README.md
+recursive-include docs *.md
+recursive-include tests *.py

@@ -396,7 +396,6 @@ def test_rejected_default_marks_model_as_without_reasoning() -> None:
 # ----- Task 008a: Responses API streaming -----
 
 from neurobrau_cli.providers.base import (  # noqa: E402
-    ReasoningDelta,
     StreamCompleted,
     StreamFailed,
     StreamIncomplete,
