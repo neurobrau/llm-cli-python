@@ -2,6 +2,7 @@
 
 import curses
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 
 import pytest
 
@@ -13,68 +14,15 @@ from neurobrau_cli.providers.openai_provider import (
     OpenAIProviderError,
     TokenUsage,
 )
+from neurobrau_cli.session import ChatSession
+from neurobrau_cli.storage import HistoryStore
 from neurobrau_cli.ui import tui
 from neurobrau_cli.ui.tui import Entry, Styles, TuiApp
 
+from fakes import FakeScreen
+
 SETTINGS = ChatSettings(provider="openai", model="gpt-test")
 STYLES = Styles(border=1, text=2, user=3, ai=4, info=5, error=6, waiting=7)
-
-
-class FakeScreen:
-    """Records drawing into a character grid; fails on writes a real terminal rejects."""
-
-    def __init__(self, rows: int = 25, cols: int = 80, keys: Iterable[str | int] = ()) -> None:
-        self.rows, self.cols = rows, cols
-        self.keys = list(keys)
-        self.cursor = (0, 0)
-        self.snapshots: list[list[str]] = []
-        self.erase()
-
-    def getmaxyx(self) -> tuple[int, int]:
-        return self.rows, self.cols
-
-    def erase(self) -> None:
-        self.chars = [[" "] * self.cols for _ in range(self.rows)]
-        self.attrs = [[0] * self.cols for _ in range(self.rows)]
-
-    def addnstr(self, y: int, x: int, text: str, n: int, attr: int = 0) -> None:
-        text = text[:n]
-        assert 0 <= y < self.rows and 0 <= x, (y, x)
-        assert x + len(text) <= self.cols, f"line {y} overflows: {text!r}"
-        assert (y, x + len(text)) != (self.rows, self.cols), "wrote the last cell"
-        if y == self.rows - 1:
-            assert x + len(text) < self.cols, "wrote the bottom-right cell"
-        for offset, char in enumerate(text):
-            self.chars[y][x + offset] = char
-            self.attrs[y][x + offset] = attr
-
-    def move(self, y: int, x: int) -> None:
-        assert 0 <= y < self.rows and 0 <= x < self.cols, (y, x)
-        self.cursor = (y, x)
-
-    def refresh(self) -> None:
-        self.snapshots.append(self.lines())
-
-    def get_wch(self) -> str | int:
-        if not self.keys:
-            return tui.CTRL_D  # end of script: exit like Ctrl+D on empty input
-        key = self.keys.pop(0)
-        if key == "<CTRL-C>":
-            raise KeyboardInterrupt
-        return key
-
-    def lines(self) -> list[str]:
-        return ["".join(row) for row in self.chars]
-
-    def text(self) -> str:
-        return "\n".join(self.lines())
-
-    def attr_at(self, needle: str) -> int:
-        for y, line in enumerate(self.lines()):
-            x = line.find(needle)
-            if x >= 0:
-                return self.attrs[y][x]
-        raise AssertionError(f"{needle!r} not on screen")
 
 
 class FakeModel:
@@ -487,3 +435,136 @@ def test_run_tui_handles_interrupt_outside_loop(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(tui.curses, "wrapper", interrupted_wrapper)
 
     assert tui.run_tui(SETTINGS, FakeModel()) == EXIT_INTERRUPTED
+
+
+# ----- persistent history -----
+
+
+def make_persistent_app(
+    store: HistoryStore, keys: Iterable[str | int] = (), model: FakeModel | None = None
+) -> tuple[TuiApp, FakeScreen, FakeModel]:
+    screen = FakeScreen(25, 80, keys)
+    model = model or FakeModel()
+    session = ChatSession.restore(store)
+    return TuiApp(screen, SETTINGS, model, STYLES, session), screen, model
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> HistoryStore:
+    return HistoryStore(tmp_path / "conversations")
+
+
+def test_restored_conversation_is_displayed_and_continued(store: HistoryStore) -> None:
+    first, _, _ = make_persistent_app(store, keys_for("My name is Ada."), FakeModel(["Hi Ada."]))
+    first.run()
+
+    app, screen, model = make_persistent_app(store, keys_for("What is my name?"))
+    app.render()
+    text = screen.text()
+    assert "YOU > My name is Ada." in text
+    assert "AI > Hi Ada." in text
+    assert "Restored conversation from" in text
+
+    app.run()
+    assert model.calls[0][:2] == [
+        Message("user", "My name is Ada."),
+        Message("assistant", "Hi Ada."),
+    ]
+
+
+def test_exchange_is_saved_before_exit(store: HistoryStore) -> None:
+    app, _, _ = make_persistent_app(store, [*keys_for("Saved?"), "<CTRL-C>"])
+
+    assert app.run() == EXIT_INTERRUPTED
+    assert ChatSession.restore(store).messages[0] == Message("user", "Saved?")
+
+
+def test_failed_request_is_not_saved(store: HistoryStore) -> None:
+    failure = OpenAIProviderError("boom", ErrorKind.API)
+    app, _, _ = make_persistent_app(store, keys_for("Lost"), FakeModel([failure]))
+
+    app.run()
+
+    assert store.list_paths() == []
+
+
+def test_reset_preserves_previous_session_on_disk(store: HistoryStore) -> None:
+    app, screen, _ = make_persistent_app(store, keys_for("Old", "/reset"))
+
+    app.run()
+
+    assert len(store.list_paths()) == 2
+    assert "The previous one stays saved." in screen.text()
+    assert "Old" not in screen.text()
+    assert ChatSession.restore(store).messages == ()
+
+
+@pytest.mark.parametrize("command", ["/cleanup", "\\cleanup"])
+def test_cleanup_requires_confirmation(store: HistoryStore, command: str) -> None:
+    make_persistent_app(store, keys_for("Keep?"))[0].run()
+
+    app, screen, model = make_persistent_app(store, keys_for(command))
+    app.run()
+    seen = screen.snapshots[-1]
+
+    assert any("Delete 1 saved conversation(s)" in line for line in seen)
+    assert any("[CONFIRM: TYPE YES]" in line for line in seen)
+    assert screen.attr_at("[CONFIRM") == STYLES.waiting
+    assert len(store.list_paths()) == 1  # not deleted yet: Ctrl+D ended the script
+    assert model.calls == []
+
+
+def test_cleanup_confirmed_deletes_and_clears_screen(store: HistoryStore) -> None:
+    make_persistent_app(store, keys_for("Delete me"))[0].run()
+
+    app, screen, model = make_persistent_app(store, keys_for("/cleanup", "yes"))
+    app.run()
+
+    assert store.list_paths() == []
+    assert "Deleted 1 saved conversation(s)" in screen.text()
+    assert "Delete me" not in screen.text()
+    assert "[READY]" in screen.text()
+    assert model.calls == []
+
+
+@pytest.mark.parametrize("answer", ["no", "/exit", "y"])
+def test_cleanup_other_answer_cancels(store: HistoryStore, answer: str) -> None:
+    make_persistent_app(store, keys_for("Keep me"))[0].run()
+
+    app, screen, model = make_persistent_app(store, keys_for("/cleanup", answer))
+    app.run()
+
+    assert len(store.list_paths()) == 1
+    assert "Cleanup cancelled. Nothing was deleted." in screen.text()
+    assert app.exit_code == 0  # ended by the script's Ctrl+D, not by the "/exit" answer
+    assert model.calls == []
+
+
+def test_cleanup_with_history_disabled() -> None:
+    app, screen, _ = make_app(keys_for("/cleanup"))
+
+    app.run()
+
+    assert "history is disabled" in screen.text()
+
+
+def test_startup_warnings_are_shown(store: HistoryStore) -> None:
+    store.ensure_directory()
+    (store.directory / "broken.json").write_text("{")
+
+    app, screen, _ = make_persistent_app(store)
+    app.render()
+
+    assert "Warning: Ignoring unreadable conversation file" in screen.text()
+    assert screen.attr_at("Warning:") == STYLES.error
+
+
+def test_save_failure_is_shown_after_reply(tmp_path: Path) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    app, screen, _ = make_persistent_app(HistoryStore(blocker / "c"), keys_for("Hi"))
+
+    app.run()
+
+    assert "AI > reply 1" in screen.text()
+    assert "Warning: Could not save" in screen.text()

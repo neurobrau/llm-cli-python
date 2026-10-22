@@ -1,5 +1,8 @@
 """Tests for the command-line interface."""
 
+import json
+from collections.abc import Callable
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,6 +15,9 @@ from neurobrau_cli.providers.openai_provider import (
     OpenAIProviderError,
     TokenUsage,
 )
+from neurobrau_cli.ui.tui import Styles
+
+from fakes import FakeScreen
 
 
 @pytest.fixture
@@ -40,6 +46,8 @@ def test_help_prints_usage_and_exits_successfully(
     assert "--reasoning-effort" in output
     assert "interactive chat" in output
     assert "--plain" in output
+    assert "--no-history" in output
+    assert "--transcript-on-exit" in output
 
 
 def test_version_prints_version_and_exits_successfully(
@@ -260,7 +268,8 @@ def test_interactive_terminal_launches_tui(
     assert main(["--model", "gpt-custom", "--usage"]) == 0
 
     fake_tui.run_tui.assert_called_once()
-    settings, reply_fn = fake_tui.run_tui.call_args.args
+    settings, reply_fn, session = fake_tui.run_tui.call_args.args
+    assert session.persistent
     assert settings == cli.chat.ChatSettings("openai", "gpt-custom", show_usage=True)
     assert reply_fn.keywords["model"] == "gpt-custom"
 
@@ -332,3 +341,154 @@ def test_load_tui_returns_curses_module() -> None:
 
     assert module is not None
     assert callable(module.run_tui)
+
+
+# ----- persistent history -----
+
+
+def history_files(state_home: Path) -> list[Path]:
+    directory = state_home / "neurobrau" / "conversations"
+    return sorted(directory.glob("*.json")) if directory.exists() else []
+
+
+def test_history_persists_across_runs(
+    fake_chat_backend: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_state_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    feed_input(monkeypatch, "Remember this", "/exit")
+    main([])
+    assert len(history_files(isolated_state_home)) == 1
+
+    feed_input(monkeypatch, "And this")
+    main([])
+
+    history = fake_chat_backend.call_args.args[0]
+    assert [m.content for m in history] == ["Remember this", "Hello!", "And this"]
+    assert "Restored conversation from" in capsys.readouterr().out
+
+
+def test_no_history_flag_neither_loads_nor_saves(
+    fake_chat_backend: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_state_home: Path,
+) -> None:
+    feed_input(monkeypatch, "Saved")
+    main([])
+
+    feed_input(monkeypatch, "Not saved")
+    main(["--no-history"])
+
+    assert [m.content for m in fake_chat_backend.call_args.args[0]] == ["Not saved"]
+    restored = json.loads(history_files(isolated_state_home)[0].read_text())
+    assert [m["content"] for m in restored["messages"]] == ["Saved", "Hello!"]
+
+
+def test_one_shot_prompt_does_not_touch_history(
+    fake_generate: MagicMock, isolated_state_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["Hi"]) == 0
+
+    assert capsys.readouterr().out == "Paris.\n"
+    assert not isolated_state_home.exists()
+
+
+def test_corrupt_history_does_not_crash_cli(
+    fake_chat_backend: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_state_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    directory = isolated_state_home / "neurobrau" / "conversations"
+    directory.mkdir(parents=True)
+    (directory / "bad.json").write_text("{")
+    feed_input(monkeypatch, "Hi")
+
+    assert main([]) == 0
+    err = capsys.readouterr().err
+    assert "warning: Ignoring unreadable conversation file" in err
+    assert "Traceback" not in err
+    assert (directory / "bad.json").read_text() == "{"
+
+
+@pytest.fixture
+def curses_with_fake_screen(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> dict[str, object]:
+    """Run the real TUI on a FakeScreen; record stdout written while "curses" is active."""
+    from neurobrau_cli.ui import tui
+
+    record: dict[str, object] = {"keys": []}
+
+    def fake_wrapper(main_fn: Callable[[FakeScreen], int]) -> int:
+        record["stdout_before"] = capsys.readouterr().out
+        try:
+            return main_fn(FakeScreen(25, 80, record["keys"]))  # type: ignore[arg-type]
+        finally:
+            # The real wrapper calls endwin() here, restoring the terminal.
+            record["stdout_during_curses"] = capsys.readouterr().out
+
+    monkeypatch.setattr(tui.curses, "wrapper", fake_wrapper)
+    monkeypatch.setattr(tui, "init_styles", Styles)
+    monkeypatch.setattr(cli, "is_fullscreen_terminal", lambda: True)
+    return record
+
+
+def type_keys(*messages: str) -> list[str]:
+    return [key for message in messages for key in [*message, "\n"]]
+
+
+def test_transcript_is_printed_after_curses_exits(
+    fake_chat_backend: MagicMock,
+    curses_with_fake_screen: dict[str, object],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    curses_with_fake_screen["keys"] = type_keys("First question", "/exit")
+
+    assert main(["--transcript-on-exit"]) == 0
+
+    assert curses_with_fake_screen["stdout_during_curses"] == ""
+    assert capsys.readouterr().out == "YOU > First question\n\nAI > Hello!\n"
+
+
+def test_transcript_includes_restored_messages(
+    fake_chat_backend: MagicMock,
+    curses_with_fake_screen: dict[str, object],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    curses_with_fake_screen["keys"] = type_keys("One", "/exit")
+    main([])
+    capsys.readouterr()
+    curses_with_fake_screen["keys"] = type_keys("Two", "/exit")
+
+    main(["--transcript-on-exit"])
+
+    assert capsys.readouterr().out == (
+        "YOU > One\n\nAI > Hello!\n\nYOU > Two\n\nAI > Hello!\n"
+    )
+
+
+def test_transcript_printed_after_ctrl_c(
+    fake_chat_backend: MagicMock,
+    curses_with_fake_screen: dict[str, object],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    curses_with_fake_screen["keys"] = [*type_keys("Hi"), "<CTRL-C>"]
+
+    assert main(["--transcript-on-exit"]) == 130
+    assert capsys.readouterr().out == "YOU > Hi\n\nAI > Hello!\n"
+
+
+def test_no_transcript_without_flag_or_messages(
+    fake_chat_backend: MagicMock,
+    curses_with_fake_screen: dict[str, object],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    curses_with_fake_screen["keys"] = type_keys("Hi", "/exit")
+    main(["--no-history"])
+    assert capsys.readouterr().out == ""
+
+    curses_with_fake_screen["keys"] = type_keys("/exit")
+    main(["--no-history", "--transcript-on-exit"])
+    assert capsys.readouterr().out == ""

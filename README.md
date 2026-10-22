@@ -32,10 +32,49 @@ The fullscreen UI starts only when stdin and stdout are terminals; otherwise
 the line-oriented chat is used. Layout, colors and keys are specified in
 [docs/tui-spec.md](docs/tui-spec.md).
 
-Chat commands: `/help`, `/reset` (clear history), `/exit`. Backslash aliases
-`\help`, `\reset`, `\exit` also work. Ctrl+D (on empty input) or Ctrl+C
-while idle exits; Ctrl+C while waiting for a response cancels that request.
-In the fullscreen UI, PgUp/PgDn and Up/Down scroll the conversation.
+Chat commands (backslash aliases such as `\help` also work):
+
+| Command | Effect |
+|---|---|
+| `/help` | list commands and keys |
+| `/reset` | start a new conversation; the previous one stays saved on disk |
+| `/cleanup` | delete **all** saved conversations after you type `yes` to confirm |
+| `/exit` | exit; the conversation stays saved |
+
+Ctrl+D (on empty input) or Ctrl+C while idle exits; Ctrl+C while waiting for
+a response cancels that request. In the fullscreen UI, PgUp/PgDn and Up/Down
+scroll the conversation.
+
+## Conversation history
+
+Interactive chats are saved automatically and the most recently updated
+conversation is restored on the next launch (plain chat and fullscreen UI
+alike). One-shot prompts are never saved.
+
+- Location: `$XDG_STATE_HOME/neurobrau/conversations/`, or
+  `~/.local/state/neurobrau/conversations/` when `XDG_STATE_HOME` is unset.
+  One JSON file per conversation, named `<id>.json`.
+- **Stored locally in plaintext.** Anyone who can read these files can read
+  your conversations. Directories are created with mode `0700` and files with
+  `0600` where the OS supports it. API keys are never written.
+- Saved immediately after each successful response, by writing a temporary
+  file and atomically renaming it, so a crash or Ctrl+C never leaves a
+  half-written file. Failed or cancelled requests are not saved.
+- Unreadable or corrupt files are reported at startup, skipped, and left
+  untouched. Storage errors are reported as warnings; the chat keeps working.
+- The JSON format is provider-independent and shared with the Go and
+  TypeScript implementations; see
+  [docs/tui-spec.md](docs/tui-spec.md#11-conversation-storage).
+
+Flags:
+
+```bash
+neurobrau --no-history            # neither restore nor save for this run
+neurobrau --transcript-on-exit    # print the conversation after the fullscreen UI closes
+```
+
+`--transcript-on-exit` applies to the fullscreen UI only (the plain chat is
+already in your scrollback). The transcript includes restored messages.
 
 ## Exit codes
 
@@ -53,7 +92,8 @@ In the fullscreen UI, PgUp/PgDn and Up/Down scroll the conversation.
 
 ## Limitations
 
-- Conversation history lives in process memory and is lost on exit.
+- Running two chats at once against the same history directory can lose
+  messages: both continue the same conversation and the last save wins.
 - Requests use `store=False`. Context is sent by replaying prior user and
   assistant **text** messages. Full Responses API output-item replay
   (reasoning items, tool calls) is not implemented yet.

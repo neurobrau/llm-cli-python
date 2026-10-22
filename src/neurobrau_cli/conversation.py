@@ -1,5 +1,6 @@
 """Provider-independent conversation history kept in process memory."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -17,8 +18,8 @@ class Message:
 class Conversation:
     """Chronological history of committed user/assistant messages."""
 
-    def __init__(self) -> None:
-        self._messages: list[Message] = []
+    def __init__(self, messages: Iterable[Message] = ()) -> None:
+        self._messages: list[Message] = list(messages)
 
     @property
     def messages(self) -> tuple[Message, ...]:

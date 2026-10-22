@@ -1,6 +1,7 @@
 """Tests for the interactive chat loop with scripted input and a fake model."""
 
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,6 +15,8 @@ from neurobrau_cli.providers.openai_provider import (
     OpenAIProviderError,
     TokenUsage,
 )
+from neurobrau_cli.session import ChatSession
+from neurobrau_cli.storage import HistoryStore
 
 SETTINGS = ChatSettings(provider="openai", model="gpt-test")
 
@@ -240,3 +243,148 @@ def test_usage_is_hidden_by_default(capsys: pytest.CaptureFixture[str]) -> None:
     run(["One"])
 
     assert "Token usage" not in capsys.readouterr().err
+
+
+# ----- persistent history -----
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> HistoryStore:
+    return HistoryStore(tmp_path / "conversations")
+
+
+def run_with_store(
+    lines: Iterable[str | BaseException], store: HistoryStore, model: FakeModel | None = None
+) -> tuple[int, FakeModel, ChatSession]:
+    model = model or FakeModel()
+    session = ChatSession.restore(store)
+    exit_code = run_chat(SETTINGS, model, input_fn=scripted_input(lines), session=session)
+    return exit_code, model, session
+
+
+def test_history_is_restored_on_next_launch(
+    store: HistoryStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_with_store(["My name is Ada.", "/exit"], store, FakeModel(["Hi Ada."]))
+    capsys.readouterr()
+
+    _, model, _ = run_with_store(["What is my name?"], store)
+
+    assert model.calls[0] == [
+        Message("user", "My name is Ada."),
+        Message("assistant", "Hi Ada."),
+        Message("user", "What is my name?"),
+    ]
+    assert "Restored conversation from" in capsys.readouterr().out
+
+
+def test_ctrl_c_exit_keeps_saved_history(store: HistoryStore) -> None:
+    run_with_store(["Remember me", KeyboardInterrupt()], store)
+
+    assert len(ChatSession.restore(store).messages) == 2
+
+
+def test_failed_request_is_not_persisted(store: HistoryStore) -> None:
+    failure = OpenAIProviderError("boom", ErrorKind.API)
+    run_with_store(["One", "Two"], store, FakeModel(["A1", failure]))
+
+    assert ChatSession.restore(store).messages == (
+        Message("user", "One"),
+        Message("assistant", "A1"),
+    )
+
+
+def test_reset_with_history_preserves_previous_session(
+    store: HistoryStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_with_store(["Old", "/reset", "New"], store)
+
+    assert len(store.list_paths()) == 2
+    assert "The previous one stays saved." in capsys.readouterr().out
+    assert ChatSession.restore(store).messages[0] == Message("user", "New")
+
+
+@pytest.mark.parametrize("command", ["/cleanup", "\\cleanup"])
+def test_cleanup_deletes_after_confirmation(
+    store: HistoryStore, command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_with_store(["Old", "/reset", "Older"], store)
+    capsys.readouterr()
+
+    _, model, session = run_with_store([command, "YES"], store)
+
+    out = capsys.readouterr().out
+    assert "Deleted 2 saved conversation(s)" in out
+    assert store.list_paths() == []
+    assert session.messages == ()
+    assert model.calls == []
+
+
+@pytest.mark.parametrize("answer", ["no", "y", "", EOFError(), KeyboardInterrupt()])
+def test_cleanup_without_confirmation_deletes_nothing(
+    store: HistoryStore, answer: str | BaseException, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_with_store(["Keep me"], store)
+    capsys.readouterr()
+
+    exit_code, model, _ = run_with_store(["/cleanup", answer], store)
+
+    assert exit_code == 0
+    assert len(store.list_paths()) == 1
+    assert "Cleanup cancelled. Nothing was deleted." in capsys.readouterr().out
+    assert model.calls == []
+
+
+def test_cleanup_prompt_names_count_and_directory(store: HistoryStore) -> None:
+    run_with_store(["Keep me"], store)
+    input_fn = scripted_input(["/cleanup", "no"])
+
+    run_chat(SETTINGS, FakeModel(), input_fn=input_fn, session=ChatSession.restore(store))
+
+    prompt = input_fn.call_args_list[1].args[0]
+    assert "Delete 1 saved conversation(s)" in prompt
+    assert str(store.directory) in prompt
+    assert "'yes'" in prompt
+
+
+def test_cleanup_with_history_disabled(capsys: pytest.CaptureFixture[str]) -> None:
+    run(["/cleanup"])
+
+    assert "history is disabled" in capsys.readouterr().out
+
+
+def test_cleanup_with_nothing_saved(store: HistoryStore, capsys: pytest.CaptureFixture[str]) -> None:
+    run_with_store(["/cleanup"], store)
+
+    assert "No saved conversations." in capsys.readouterr().out
+
+
+def test_corrupt_history_is_reported_on_startup(
+    store: HistoryStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store.ensure_directory()
+    broken = store.directory / "broken.json"
+    broken.write_text("{not json")
+
+    exit_code, _, _ = run_with_store(["Hi"], store)
+
+    err = capsys.readouterr().err
+    assert exit_code == 0
+    assert f"warning: Ignoring unreadable conversation file {broken}" in err
+    assert "Traceback" not in err
+    assert broken.read_text() == "{not json"
+
+
+def test_save_failure_is_reported_without_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+
+    exit_code, _, _ = run_with_store(["Hi"], HistoryStore(blocker / "conversations"))
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "AI > reply 1" in captured.out
+    assert "warning: Could not save conversation history" in captured.err
+    assert "Traceback" not in captured.err

@@ -13,15 +13,21 @@ from typing import Any, Literal
 from neurobrau_cli import __version__
 from neurobrau_cli.chat import (
     APP_NAME,
+    CLEANUP_CONFIRMATION,
     EXIT_INTERRUPTED,
     EXIT_OK,
     ChatSettings,
     ReplyFn,
-    exchange,
+    cleanup_prompt,
+    finish_cleanup,
+    is_confirmed,
     parse_command,
+    prepare_cleanup,
+    reset_notice,
+    restored_notice,
 )
-from neurobrau_cli.conversation import Conversation
 from neurobrau_cli.providers.openai_provider import OpenAIProviderError, TokenUsage
+from neurobrau_cli.session import ChatSession
 
 MIN_COLS = 40
 MIN_ROWS = 12
@@ -31,10 +37,11 @@ USER_LABEL = "YOU > "
 AI_LABEL = "AI > "
 HELP_LINE = " /help  /reset  /exit | PgUp/PgDn Up/Down: scroll | Ctrl+C: quit"
 HELP_TEXT = """Commands:
-  /help    show this help
-  /reset   clear the conversation history
-  /exit    exit the application
-Backslash aliases also work: \\help, \\reset, \\exit.
+  /help     show this help
+  /reset    start a new conversation (the previous one stays saved)
+  /cleanup  delete all saved conversations (asks for confirmation)
+  /exit     exit the application (the conversation stays saved)
+Backslash aliases also work: \\help, \\reset, \\cleanup, \\exit.
 Keys: Enter send, Backspace/Delete edit, Left/Right/Home/End move,
 Ctrl+U clear input, PgUp/PgDn/Up/Down scroll, Ctrl+D (empty input) or Ctrl+C quit."""
 
@@ -205,6 +212,7 @@ class TuiState:
     scroll: int = 0  # lines scrolled up from the newest message
     usage: TokenUsage | None = None
     waiting: bool = False
+    confirming_cleanup: bool = False  # next submitted line answers the cleanup prompt
 
 
 class TuiApp:
@@ -216,14 +224,26 @@ class TuiApp:
         settings: ChatSettings,
         reply_fn: ReplyFn,
         styles: Styles = Styles(),
+        session: ChatSession | None = None,
     ) -> None:
         self.screen = screen
         self.settings = settings
         self.reply_fn = reply_fn
         self.styles = styles
-        self.conversation = Conversation()
+        self.session = session or ChatSession()
         self.state = TuiState()
         self.exit_code: int | None = None
+        self.show_restored_session()
+
+    def show_restored_session(self) -> None:
+        """Show restored messages, then startup notices, at the bottom of the panel."""
+        for message in self.session.messages:
+            self.add_entry("user" if message.role == "user" else "ai", message.content)
+        for warning in self.session.startup_warnings:
+            self.add_entry("error", f"Warning: {warning}")
+        notice = restored_notice(self.session)
+        if notice:
+            self.add_entry("info", notice)
 
     # ----- main loop -----
 
@@ -292,8 +312,9 @@ class TuiApp:
         if not text:
             return
 
-        command = parse_command(text)
-        if command is not None:
+        if self.state.confirming_cleanup:
+            self.confirm_cleanup(text)
+        elif (command := parse_command(text)) is not None:
             self.run_command(command)
         else:
             self.send(text)
@@ -306,10 +327,17 @@ class TuiApp:
             case "help":
                 self.add_entry("info", HELP_TEXT)
             case "reset":
-                self.conversation.reset()
-                self.state.entries.clear()
-                self.state.usage = None
-                self.add_entry("info", "Conversation history cleared.")
+                warning = self.session.reset()
+                self.clear_panel(reset_notice(self.session))
+                if warning:
+                    self.add_entry("error", f"Warning: {warning}")
+            case "cleanup":
+                count, message = prepare_cleanup(self.session)
+                if message:
+                    self.add_entry("info", message)
+                else:
+                    self.add_entry("info", cleanup_prompt(self.session, count))
+                    self.state.confirming_cleanup = True
             case _:
                 self.add_entry("error", f"Unknown command: /{command}. Type /help for commands.")
 
@@ -320,7 +348,7 @@ class TuiApp:
         self.state.scroll = 0
         self.render()
         try:
-            result = exchange(self.conversation, text, self.reply_fn)
+            result, save_warning = self.session.send(text, self.reply_fn)
         except OpenAIProviderError as error:
             self.add_entry("error", f"Error: {error}")
         except KeyboardInterrupt:
@@ -329,8 +357,27 @@ class TuiApp:
             self.add_entry("ai", result.text)
             if result.usage is not None:
                 self.state.usage = result.usage
+            if save_warning:
+                self.add_entry("error", f"Warning: {save_warning}")
         finally:
             self.state.waiting = False
+
+    def confirm_cleanup(self, answer: str) -> None:
+        """Delete saved conversations only if the user typed the confirmation word."""
+        self.state.confirming_cleanup = False
+        if not is_confirmed(answer):
+            self.add_entry("info", "Cleanup cancelled. Nothing was deleted.")
+            return
+        message, success = finish_cleanup(self.session)
+        if success:
+            self.clear_panel(message)
+        else:
+            self.add_entry("error", f"Error: {message}")
+
+    def clear_panel(self, notice: str) -> None:
+        self.state.entries.clear()
+        self.state.usage = None
+        self.add_entry("info", notice)
 
     def add_entry(self, kind: EntryKind, text: str) -> None:
         self.state.entries.append(Entry(kind, text))
@@ -409,7 +456,12 @@ class TuiApp:
                 x += len(segment.text)
 
     def render_status(self, layout: Layout) -> None:
-        indicator = "[WAITING FOR RESPONSE...]" if self.state.waiting else "[READY]"
+        if self.state.waiting:
+            indicator = "[WAITING FOR RESPONSE...]"
+        elif self.state.confirming_cleanup:
+            indicator = f"[CONFIRM: TYPE {CLEANUP_CONFIRMATION.upper()}]"
+        else:
+            indicator = "[READY]"
         details = (
             f"Provider: {self.settings.provider}  Model: {self.settings.model}  "
             f"{format_status_usage(self.state.usage)}"
@@ -417,7 +469,8 @@ class TuiApp:
         width = layout.inner_width
         indicator_x = 2 + max(0, width - len(indicator))
         self.put(layout.status_row, 2, details, self.styles.text, indicator_x - 1)
-        style = self.styles.waiting if self.state.waiting else self.styles.text
+        highlighted = self.state.waiting or self.state.confirming_cleanup
+        style = self.styles.waiting if highlighted else self.styles.text
         self.put(layout.status_row, indicator_x, indicator, style, layout.cols - 2)
 
     def render_input(self, layout: Layout) -> None:
@@ -479,7 +532,7 @@ def init_styles() -> Styles:
     )
 
 
-def run_tui(settings: ChatSettings, reply_fn: ReplyFn) -> int:
+def run_tui(settings: ChatSettings, reply_fn: ReplyFn, session: ChatSession | None = None) -> int:
     """Run the fullscreen chat. `curses.wrapper` restores the terminal on any exit."""
     try:
         locale.setlocale(locale.LC_ALL, "")  # needed for non-ASCII input and output
@@ -493,7 +546,7 @@ def run_tui(settings: ChatSettings, reply_fn: ReplyFn) -> int:
             curses.curs_set(1)
         except curses.error:
             pass
-        return TuiApp(screen, settings, reply_fn, styles).run()
+        return TuiApp(screen, settings, reply_fn, styles, session).run()
 
     try:
         return curses.wrapper(main)

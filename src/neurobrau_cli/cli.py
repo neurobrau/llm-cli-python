@@ -9,9 +9,11 @@ from types import ModuleType
 from typing import TextIO
 
 from neurobrau_cli import __version__, chat
-from neurobrau_cli.formatting import format_usage
+from neurobrau_cli.formatting import format_transcript, format_usage
 from neurobrau_cli.providers import openai_provider
 from neurobrau_cli.providers.openai_provider import ErrorKind, OpenAIProviderError
+from neurobrau_cli.session import ChatSession
+from neurobrau_cli.storage import HistoryStore, default_history_dir
 
 PROG_NAME = "neurobrau"
 PROVIDERS = ("openai",)
@@ -96,6 +98,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use the line-oriented chat instead of the fullscreen interface",
     )
+    parser.add_argument(
+        "--no-history",
+        action="store_true",
+        help="do not load or save conversation history for this run",
+    )
+    parser.add_argument(
+        "--transcript-on-exit",
+        action="store_true",
+        help="print the conversation after the fullscreen interface closes",
+    )
     return parser
 
 
@@ -136,12 +148,32 @@ def run_interactive(args: argparse.Namespace) -> int:
     settings = chat.ChatSettings(
         provider=args.provider, model=args.model, show_usage=args.usage
     )
+    session = open_session(args.no_history)
     if not args.plain and is_fullscreen_terminal():
         tui = load_tui()
         if tui is not None:
-            return tui.run_tui(settings, reply_fn)
+            exit_code = tui.run_tui(settings, reply_fn, session)
+            # curses has restored the terminal by now, so this is normal output.
+            if args.transcript_on_exit and session.messages:
+                print(format_transcript(session.messages))
+            return exit_code
     chat.enable_line_editing()
-    return chat.run_chat(settings, reply_fn, input_fn=input)
+    return chat.run_chat(settings, reply_fn, input_fn=input, session=session)
+
+
+def open_session(no_history: bool) -> ChatSession:
+    """Restore the latest saved conversation unless history is disabled."""
+    if no_history:
+        return ChatSession()
+    try:
+        directory = default_history_dir()
+    except RuntimeError:  # home directory cannot be determined
+        session = ChatSession()
+        session.startup_warnings.append(
+            "Cannot determine the home directory; conversation history is disabled."
+        )
+        return session
+    return ChatSession.restore(HistoryStore(directory))
 
 
 def is_fullscreen_terminal() -> bool:

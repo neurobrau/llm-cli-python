@@ -15,8 +15,26 @@ character where practical.
 | `neurobrau "question"` | One-shot request, no chat |
 | Platform without curses support | Line-oriented chat |
 
+Flags for interactive mode (both chat styles unless noted):
+
+| Flag | Effect |
+|---|---|
+| `--no-history` | do not restore or save conversations for this run (section 11) |
+| `--transcript-on-exit` | TUI only: print the transcript after the terminal is restored (section 9) |
+
 The API key is checked **before** entering fullscreen mode; a missing key
 exits with code 3 without touching the terminal.
+
+### Startup contents
+
+When a saved conversation is restored (section 11), the conversation panel
+starts with its messages as normal user/AI entries, followed by:
+
+1. one error entry per startup warning: `Warning: <message>` (e.g. a corrupt
+   file was skipped);
+2. an info entry
+   `Restored conversation from YYYY-MM-DD HH:MM (N messages). Type /reset to start a new one.`
+   (local time of `updated_at`). Not shown for an empty conversation.
 
 ## 2. Layout
 
@@ -135,9 +153,15 @@ again after `/reset`. Missing individual counts are shown as `?`. Usage shows
 the **last** response, not a session total. It is always visible; the
 `--usage` flag only affects the plain and one-shot modes.
 
-Right-aligned state indicator: `[READY]`, or `[WAITING FOR RESPONSE...]`
-while a request is in flight. The left text is truncated so it never
-overlaps the indicator.
+Right-aligned state indicator, in priority order:
+
+| Indicator | When | Style |
+|---|---|---|
+| `[WAITING FOR RESPONSE...]` | a request is in flight | waiting |
+| `[CONFIRM: TYPE YES]` | `/cleanup` is waiting for confirmation | waiting |
+| `[READY]` | otherwise | text |
+
+The left text is truncated so it never overlaps the indicator.
 
 ## 6. Input line
 
@@ -175,18 +199,37 @@ Other keys are ignored.
    | Command | Effect |
    |---|---|
    | `/help`, `\help` | append the help text (commands and keys) as an info entry |
-   | `/reset`, `\reset` | clear conversation history **and** the panel, reset token usage, show "Conversation history cleared." |
-   | `/exit`, `\exit` | exit with code 0 |
+   | `/reset`, `\reset` | start a new empty conversation, clear the panel and token usage, show a notice (below). The previous conversation stays on disk. |
+   | `/cleanup`, `\cleanup` | ask for confirmation, then delete all saved conversations (below) |
+   | `/exit`, `\exit` | exit with code 0; the saved conversation is kept |
    | anything else | error entry: `Unknown command: /<name>. Type /help for commands.` |
 
    Command names are case-insensitive.
+
+   `/reset` notice: `Started a new conversation. The previous one stays saved.`
+   with history enabled, `Conversation history cleared.` with `--no-history`.
+   Resetting an already empty conversation reuses it.
+
+   `/cleanup` flow:
+   * History disabled: info `Conversation history is disabled for this session (--no-history).`
+   * No files: info `No saved conversations.`
+   * Otherwise: info entry
+     `Delete N saved conversation(s) in <dir>? This cannot be undone. Type 'yes' to confirm: `
+     and the indicator switches to `[CONFIRM: TYPE YES]`. The **next submitted
+     line** is the answer and is never sent to the model or run as a command.
+     Only `yes` (case-insensitive, surrounding spaces ignored) confirms.
+     Confirmed: delete, clear the panel, show
+     `Deleted N saved conversation(s). Started a new conversation.`
+     Anything else: `Cleanup cancelled. Nothing was deleted.`
 3. Otherwise the text is a message:
    1. Append it to the panel as a user entry.
    2. Show `[WAITING FOR RESPONSE...]` and redraw **before** the blocking
       request starts.
    3. Send the committed history plus the new user message.
    4. On success: commit the user/assistant pair to history, append the
-      reply as an AI entry, update token usage.
+      reply as an AI entry, update token usage, then save the conversation
+      (section 11). If saving fails, append `Warning: <message>` as an error
+      entry; the exchange stays in memory and the chat continues.
    5. On failure: append `Error: <message>` as an error entry; history is
       unchanged (the user entry stays visible but is not part of the context).
    6. Return to `[READY]`.
@@ -205,6 +248,23 @@ The terminal (alternate screen, echo, cursor mode, colors) is always
 restored on exit, including on exceptions; in Python this is guaranteed by
 `curses.wrapper`. No traceback is printed for Ctrl+C.
 
+With `--transcript-on-exit`, **after** the terminal is restored (so the text
+stays in the normal scrollback) and for every exit path above, the complete
+conversation, including restored messages, is printed to stdout:
+
+```
+YOU > first message
+
+AI > first reply
+
+YOU > second message
+```
+
+Each message is `YOU > ` or `AI > ` followed by its content unchanged (no
+wrapping; the terminal wraps). Messages are separated by one blank line and
+the output ends with a single newline. Nothing is printed for an empty
+conversation. Only committed messages appear (no errors or notices).
+
 ## 10. Porting notes
 
 * Keep the pure logic (layout, wrapping, scrolling, key handling) separate
@@ -215,3 +275,78 @@ restored on exit, including on exceptions; in Python this is guaranteed by
   wrap, collapse nothing inside a line, break over-long words at the width.
 * Character widths are counted as one column per code point; wide (CJK,
   emoji) characters are a known limitation.
+
+## 11. Conversation storage
+
+Shared by the plain chat and the TUI, and by all three implementations, so a
+conversation saved by one can be continued by another.
+
+### Location
+
+`$XDG_STATE_HOME/neurobrau/conversations/` if `XDG_STATE_HOME` is set to an
+**absolute** path; otherwise `~/.local/state/neurobrau/conversations/`.
+One file per conversation: `<id>.json`. Other files in the directory are
+ignored, and left alone by `/cleanup`.
+
+Files are **plaintext**. Create the `neurobrau` and `conversations`
+directories with mode `0700` and files with `0600` where supported, and
+tighten both directories to `0700` at startup if they already exist.
+Never change directories above `neurobrau`. Never store credentials.
+
+### File format (schema version 1)
+
+UTF-8 JSON (non-ASCII written as-is, 2-space indent, trailing newline):
+
+```json
+{
+  "schema_version": 1,
+  "id": "4b8ba3bd-5f42-4302-a01e-2d6ed0eb4905",
+  "created_at": "2026-10-21T12:00:00.000Z",
+  "updated_at": "2026-10-21T12:03:41.512Z",
+  "messages": [
+    {"role": "user", "content": "What is a neural network?"},
+    {"role": "assistant", "content": "A neural network is ..."}
+  ]
+}
+```
+
+| Field | Type | Rules |
+|---|---|---|
+| `schema_version` | integer | must be `1`; other values are unsupported (reported, file left alone) |
+| `id` | string | canonical lowercase UUID (version 4 when generated); also the file name |
+| `created_at` | string | RFC 3339 with time zone; written as UTC, millisecond precision, `Z` suffix |
+| `updated_at` | string | same format; set on every save |
+| `messages` | array | chronological; each `{"role": "user" \| "assistant", "content": string}` |
+
+Readers must accept any RFC 3339 offset (e.g. `+02:00`) and ignore unknown
+fields at the top level and in messages, so newer writers stay compatible.
+Messages are provider-independent text; no model, token or provider data is
+stored.
+
+### Behavior
+
+* **Restore:** at interactive startup, load every `*.json` file and continue
+  the valid one with the greatest `updated_at` (ties: newest file
+  modification time). No valid file means a new conversation, which is not
+  written until its first successful exchange.
+* **Invalid files** (unreadable, not UTF-8, not JSON, failing the rules
+  above) produce a startup warning
+  `Ignoring unreadable conversation file <path>: <reason>. The file was left unchanged.`
+  and are skipped; they are never modified or deleted except by a confirmed
+  `/cleanup`.
+* **Save:** after each successful exchange, write the whole file atomically:
+  write a temp file in the same directory (`.<id>.<random>.tmp`, mode
+  `0600`), flush and fsync it, rename it over `<id>.json`, then fsync the
+  directory where supported. Remove the temp file if anything fails,
+  including Ctrl+C.
+* **Failed requests** (API errors, Ctrl+C while waiting) save nothing.
+* **`/reset`:** if the conversation is non-empty, start a new one with a new
+  `id` and `created_at`, and save it immediately (empty `messages`) so it is
+  the one restored next time. The old file is untouched.
+* **`/cleanup`:** after confirmation, delete every `*.json` file in the
+  directory, then start a new unsaved conversation.
+* **`--no-history`:** no reads, writes or permission changes at all.
+* **Errors** (permissions, disk full, path is a file, …) are shown as
+  `Could not <read|save|delete> conversation history at <path>: <reason>.`
+  and never as a stack trace.
+* Concurrent instances are not coordinated; the last save of a file wins.
