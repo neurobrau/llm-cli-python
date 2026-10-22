@@ -15,3 +15,6 @@ __pycache__/
 config.local.toml
 dist/
 build/
+
+# JetBrains IDE
+.idea/
